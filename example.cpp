@@ -13,6 +13,8 @@
 // 3) Include that header here and decrypt at runtime using a passphrase from
 //    an environment variable.
 //
+// For packed blobs, use --binding none so decryption works across runs.
+//
 // Build (MSVC):
 //   cl /std:c++20 /EHsc example.cpp
 //

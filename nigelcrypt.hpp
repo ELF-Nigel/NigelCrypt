@@ -841,8 +841,13 @@ class SecureString {
 public:
     SecureString() = default;
 
-    explicit SecureString(std::string_view plain, std::string_view aad = {}, Algorithm alg = Algorithm::Aes256Gcm) {
-        encrypt(plain, aad, alg);
+    explicit SecureString(
+        std::string_view plain,
+        std::string_view aad = {},
+        Algorithm alg = Algorithm::Aes256Gcm,
+        RuntimeBinding binding = RuntimeBinding::Process
+    ) {
+        encrypt(plain, aad, alg, binding);
     }
 
     SecureString(const SecureString&) = delete;
@@ -857,6 +862,7 @@ public:
             clear();
             version_ = other.version_;
             algorithm_ = other.algorithm_;
+            binding_ = other.binding_;
             key_id_ = other.key_id_;
             ciphertext_ = std::move(other.ciphertext_);
             nonce_ = other.nonce_;
@@ -868,17 +874,24 @@ public:
             other.tag_.fill(0);
             other.salt_.fill(0);
             other.context_.fill(0);
+            other.binding_ = RuntimeBinding::Process;
         }
         return *this;
     }
 
     ~SecureString() { clear(); }
 
-    void encrypt(std::string_view plain, std::string_view aad = {}, Algorithm alg = Algorithm::Aes256Gcm) {
+    void encrypt(
+        std::string_view plain,
+        std::string_view aad = {},
+        Algorithm alg = Algorithm::Aes256Gcm,
+        RuntimeBinding binding = RuntimeBinding::Process
+    ) {
         clear();
 
         version_ = 1;
         algorithm_ = alg;
+        binding_ = binding;
 
         detail::gen_random(salt_.data(), salt_.size());
         detail::gen_random(nonce_.data(), nonce_.size());
@@ -893,18 +906,34 @@ public:
         std::vector<uint8_t> ikm(master.bytes.begin(), master.bytes.end());
         std::vector<uint8_t> salt(salt_.begin(), salt_.end());
         std::vector<uint8_t> info;
-        info.reserve(nonce_.size() + context_.size());
+        info.reserve(nonce_.size() + context_.size() + 32 + 32);
         info.insert(info.end(), nonce_.begin(), nonce_.end());
         info.insert(info.end(), context_.begin(), context_.end());
 
+        std::vector<uint8_t> aad_hash;
+        if (!aad.empty()) {
+            aad_hash = detail::sha256(std::vector<uint8_t>(aad.begin(), aad.end()));
+            info.insert(info.end(), aad_hash.begin(), aad_hash.end());
+        }
+
+        std::vector<uint8_t> binding_bytes = detail::runtime_binding_bytes(binding_);
+        if (!binding_bytes.empty()) {
+            info.insert(info.end(), binding_bytes.begin(), binding_bytes.end());
+        }
+
         std::vector<uint8_t> key = detail::hkdf_sha256(std::move(ikm), std::move(salt), std::move(info), 32);
+
+        std::vector<uint8_t> auth_data;
+        auth_data.reserve(aad.size() + binding_bytes.size());
+        auth_data.insert(auth_data.end(), aad.begin(), aad.end());
+        auth_data.insert(auth_data.end(), binding_bytes.begin(), binding_bytes.end());
 
         if (algorithm_ == Algorithm::Aes256Gcm) {
             detail::aes256_gcm_encrypt(
                 key.data(), key.size(),
                 reinterpret_cast<const uint8_t*>(plain.data()), plain.size(),
                 nonce_.data(), nonce_.size(),
-                reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                auth_data.empty() ? nullptr : auth_data.data(), auth_data.size(),
                 ciphertext_,
                 tag_
             );
@@ -913,7 +942,7 @@ public:
                 key.data(), key.size(),
                 reinterpret_cast<const uint8_t*>(plain.data()), plain.size(),
                 nonce_.data(), nonce_.size(),
-                reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                auth_data.empty() ? nullptr : auth_data.data(), auth_data.size(),
                 ciphertext_,
                 tag_
             );
@@ -938,11 +967,27 @@ public:
         std::vector<uint8_t> ikm(master.bytes.begin(), master.bytes.end());
         std::vector<uint8_t> salt(salt_.begin(), salt_.end());
         std::vector<uint8_t> info;
-        info.reserve(nonce_.size() + context_.size());
+        info.reserve(nonce_.size() + context_.size() + 32 + 32);
         info.insert(info.end(), nonce_.begin(), nonce_.end());
         info.insert(info.end(), context_.begin(), context_.end());
 
+        std::vector<uint8_t> aad_hash;
+        if (!aad.empty()) {
+            aad_hash = detail::sha256(std::vector<uint8_t>(aad.begin(), aad.end()));
+            info.insert(info.end(), aad_hash.begin(), aad_hash.end());
+        }
+
+        std::vector<uint8_t> binding_bytes = detail::runtime_binding_bytes(binding_);
+        if (!binding_bytes.empty()) {
+            info.insert(info.end(), binding_bytes.begin(), binding_bytes.end());
+        }
+
         std::vector<uint8_t> key = detail::hkdf_sha256(std::move(ikm), std::move(salt), std::move(info), 32);
+
+        std::vector<uint8_t> auth_data;
+        auth_data.reserve(aad.size() + binding_bytes.size());
+        auth_data.insert(auth_data.end(), aad.begin(), aad.end());
+        auth_data.insert(auth_data.end(), binding_bytes.begin(), binding_bytes.end());
 
         std::vector<uint8_t> plain;
         if (algorithm_ == Algorithm::Aes256Gcm) {
@@ -950,7 +995,7 @@ public:
                 key.data(), key.size(),
                 ciphertext_.data(), ciphertext_.size(),
                 nonce_.data(), nonce_.size(),
-                reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                auth_data.empty() ? nullptr : auth_data.data(), auth_data.size(),
                 tag_
             );
         } else if (algorithm_ == Algorithm::ChaCha20Poly1305) {
@@ -958,7 +1003,7 @@ public:
                 key.data(), key.size(),
                 ciphertext_.data(), ciphertext_.size(),
                 nonce_.data(), nonce_.size(),
-                reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                auth_data.empty() ? nullptr : auth_data.data(), auth_data.size(),
                 tag_
             );
         } else {
@@ -980,26 +1025,16 @@ public:
 
     std::vector<uint8_t> export_envelope() const {
         static constexpr uint32_t kMagic = 0x5243474E; // 'NGCR'
-        struct Header {
-            uint32_t magic;
-            uint16_t version;
-            uint16_t alg;
-            uint32_t key_id;
-            uint32_t ciphertext_len;
-        };
-
-        Header h{};
-        h.magic = kMagic;
-        h.version = static_cast<uint16_t>(version_);
-        h.alg = static_cast<uint16_t>(algorithm_);
-        h.key_id = key_id_;
-        h.ciphertext_len = static_cast<uint32_t>(ciphertext_.size());
-
         std::vector<uint8_t> out;
-        out.reserve(sizeof(Header) + salt_.size() + nonce_.size() + context_.size() + tag_.size() + ciphertext_.size());
+        out.reserve(4 + 2 + 2 + 2 + 4 + 4 + salt_.size() + nonce_.size() + context_.size() + tag_.size() + ciphertext_.size());
 
-        const uint8_t* hp = reinterpret_cast<const uint8_t*>(&h);
-        out.insert(out.end(), hp, hp + sizeof(Header));
+        detail::append_u32(out, kMagic);
+        detail::append_u16(out, static_cast<uint16_t>(version_));
+        detail::append_u16(out, static_cast<uint16_t>(algorithm_));
+        detail::append_u16(out, static_cast<uint16_t>(binding_));
+        detail::append_u32(out, key_id_);
+        detail::append_u32(out, static_cast<uint32_t>(ciphertext_.size()));
+
         out.insert(out.end(), salt_.begin(), salt_.end());
         out.insert(out.end(), nonce_.begin(), nonce_.end());
         out.insert(out.end(), context_.begin(), context_.end());
@@ -1010,40 +1045,38 @@ public:
 
     static SecureString import_envelope(const std::vector<uint8_t>& data) {
         static constexpr uint32_t kMagic = 0x5243474E; // 'NGCR'
-        struct Header {
-            uint32_t magic;
-            uint16_t version;
-            uint16_t alg;
-            uint32_t key_id;
-            uint32_t ciphertext_len;
-        };
-
-        if (data.size() < sizeof(Header)) {
+        if (data.size() < 4 + 2 + 2 + 2 + 4 + 4) {
             throw std::runtime_error("Envelope too small");
         }
 
-        Header h{};
-        std::memcpy(&h, data.data(), sizeof(Header));
-        if (h.magic != kMagic || h.version == 0) {
+        size_t off = 0;
+        const uint32_t magic = detail::read_u32(data, off);
+        const uint16_t version = detail::read_u16(data, off);
+        const uint16_t alg = detail::read_u16(data, off);
+        const uint16_t binding = detail::read_u16(data, off);
+        const uint32_t key_id = detail::read_u32(data, off);
+        const uint32_t ciphertext_len = detail::read_u32(data, off);
+
+        if (magic != kMagic || version == 0) {
             throw std::runtime_error("Invalid envelope header");
         }
 
-        const size_t fixed = sizeof(Header) + 16 + 12 + 16 + 16;
+        const size_t fixed = (4 + 2 + 2 + 2 + 4 + 4) + 16 + 12 + 16 + 16;
         if (data.size() < fixed) {
             throw std::runtime_error("Envelope missing fields");
         }
 
-        const size_t expected = fixed + h.ciphertext_len;
+        const size_t expected = fixed + ciphertext_len;
         if (data.size() != expected) {
             throw std::runtime_error("Envelope size mismatch");
         }
 
         SecureString s;
-        s.version_ = h.version;
-        s.algorithm_ = static_cast<Algorithm>(h.alg);
-        s.key_id_ = h.key_id;
+        s.version_ = version;
+        s.algorithm_ = static_cast<Algorithm>(alg);
+        s.binding_ = static_cast<RuntimeBinding>(binding);
+        s.key_id_ = key_id;
 
-        size_t off = sizeof(Header);
         std::memcpy(s.salt_.data(), data.data() + off, s.salt_.size());
         off += s.salt_.size();
         std::memcpy(s.nonce_.data(), data.data() + off, s.nonce_.size());
@@ -1053,7 +1086,7 @@ public:
         std::memcpy(s.tag_.data(), data.data() + off, s.tag_.size());
         off += s.tag_.size();
 
-        s.ciphertext_.assign(data.begin() + static_cast<long>(off), data.end());
+        s.ciphertext_.assign(data.begin() + int(off), data.end());
         return s;
     }
 
@@ -1071,6 +1104,7 @@ public:
 private:
     uint16_t version_ = 1;
     Algorithm algorithm_ = Algorithm::Aes256Gcm;
+    RuntimeBinding binding_ = RuntimeBinding::Process;
     uint32_t key_id_ = 1;
     std::vector<uint8_t> ciphertext_;
     std::array<uint8_t, 12> nonce_{}; // 96-bit nonce for GCM

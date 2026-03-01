@@ -15,6 +15,7 @@ Header-only, Windows-only string protection utility focused on **real authentica
 - Optional Associated Data (AAD) to bind decryption to a context.
 - Versioned envelope export/import for storage and key rotation.
 - Optional build-time packing to keep plaintext out of your binary.
+- Optional runtime binding to process context for stronger in-memory protection.
 
 ## What This Is Not
 - Not anti-debugging, anti-tamper, or polymorphic obfuscation.
@@ -47,10 +48,15 @@ int main() {
 If you want to ensure plaintext is **not embedded** in the binary, you must avoid string literals. Use the packer tool to encrypt a plaintext file at build time, then embed only ciphertext.
 
 ### 1) Create a plaintext file (not checked into source control)
-```\nsecret.txt\n```
+```
+secret.txt
+```
 
 ### 2) Run the packer (on Windows)
-```\nset NIGELCRYPT_PASSPHRASE=your-strong-passphrase\nnigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE\n```
+```
+set NIGELCRYPT_PASSPHRASE=your-strong-passphrase
+nigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE --binding none
+```
 
 This generates `packed/secret_blob.hpp` containing only ciphertext, salt, iteration count, and key id.
 
@@ -75,6 +81,14 @@ auto plain = s.decrypt();
 ```
 
 **Important:** The passphrase must be supplied at runtime (env var, user input, secure vault). Do not hardcode it.
+
+### Sample PowerShell Script
+`tools/pack_sample.ps1` builds the packer and generates the header:
+
+```
+$env:NIGELCRYPT_PASSPHRASE = "your-strong-passphrase"
+.\tools\pack_sample.ps1 -PlaintextPath .\secret.txt
+```
 
 ## Algorithm Selection
 Choose AES-256-GCM (default) or ChaCha20-Poly1305:
@@ -132,6 +146,16 @@ nigelcrypt::set_key_provider(std::make_shared<MyProvider>());
 ```
 
 Note: ChaCha20-Poly1305 requires a Windows version that exposes the CNG algorithm `BCRYPT_CHACHA20_POLY1305_ALGORITHM`.
+
+## Runtime Binding
+For in-memory strings created at runtime, you can bind encryption to the current process. This makes ciphertext invalid if moved to another process.
+
+```cpp
+using nigelcrypt::RuntimeBinding;
+SecureString s("runtime-only", {}, Algorithm::Aes256Gcm, RuntimeBinding::Process);
+```
+
+Do not use process binding for build-time packed blobs, because the packer runs in a different process.
 
 ## Envelope Export/Import
 Persist encrypted data as a self-describing envelope:
