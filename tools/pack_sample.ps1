@@ -13,7 +13,7 @@ param(
     [string]$Alg = "aes",
     [string]$Binding = "none",
     [string]$Aad = "",
-    [int]$Iterations = 600000,
+    [int]$Iterations = 1000000,
     [int]$KeyId = 1
 )
 

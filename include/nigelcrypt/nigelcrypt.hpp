@@ -86,6 +86,24 @@ inline void set_policy(const Policy& policy) {
     default_policy() = policy;
 }
 
+inline Policy hardened_policy() {
+    Policy p{};
+    p.require_aad = true;
+    p.require_algorithm = true;
+    p.required_algorithm = Algorithm::Aes256Gcm;
+    p.require_binding = true;
+    p.required_binding = RuntimeBinding::Process;
+    p.min_key_id = 1;
+    return p;
+}
+
+inline DecryptOptions hardened_decrypt_options() {
+    DecryptOptions o{};
+    o.buffer = BufferMode::VirtualGuarded;
+    o.require_aad = true;
+    return o;
+}
+
 struct RegionPolicy {
     bool enable = false;
     std::vector<std::string> allowlist;

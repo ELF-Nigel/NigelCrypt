@@ -15,6 +15,15 @@
 //
 // For packed blobs, use --binding none so decryption works across runs.
 //
+// This example demonstrates:
+// - Custom metadata (v3 envelope)
+// - AAD usage
+// - Policy enforcement
+// - Region policy (application-defined)
+// - Runtime binding for in-memory secrets
+// - Memory-hardened decrypt buffers
+// - Key rotation / rekey
+//
 // Build (MSVC):
 //   cl /std:c++20 /EHsc example.cpp
 //
@@ -27,6 +36,8 @@
 int main() {
     using nigelcrypt::PasswordKeyProvider;
     using nigelcrypt::SecureString;
+    using nigelcrypt::Algorithm;
+    using nigelcrypt::RuntimeBinding;
 
     // Passphrase must NOT be a string literal in your binary.
     // Provide it at runtime, e.g. via environment variable.
@@ -44,13 +55,7 @@ int main() {
     rp.allowlist = {"US"};
     nigelcrypt::set_region_policy(rp);
 
-    nigelcrypt::Policy policy;
-    policy.require_aad = false;
-    policy.require_algorithm = true;
-    policy.required_algorithm = nigelcrypt::Algorithm::Aes256Gcm;
-    policy.require_binding = false;
-    policy.min_key_id = 1;
-    nigelcrypt::set_policy(policy);
+    nigelcrypt::set_policy(nigelcrypt::hardened_policy());
 
     // Configure key provider from the generated header parameters.
     std::vector<uint8_t> salt(
@@ -76,11 +81,26 @@ int main() {
     }
 
     auto s = SecureString::import_envelope(blob);
-    nigelcrypt::DecryptOptions opt;
-    opt.buffer = nigelcrypt::BufferMode::VirtualLocked;
-    opt.require_aad = false;
+    auto opt = nigelcrypt::hardened_decrypt_options();
 
-    auto plain = s.decrypt({}, opt);
+    auto plain = s.decrypt("aad:packed", opt);
     std::cout << "Decrypted: " << plain.c_str() << "\n";
+
+    // Example: in-memory secret with runtime binding + custom metadata.
+    std::vector<uint8_t> meta = {0x4E,0x69,0x67,0x65,0x6C,0x43,0x72,0x79,0x70,0x74}; // "NigelCrypt"
+    SecureString runtime_secret;
+    runtime_secret.set_custom_meta(meta);
+    runtime_secret.encrypt("runtime-only", "aad:runtime", Algorithm::Aes256Gcm, RuntimeBinding::Process);
+    auto runtime_plain = runtime_secret.decrypt("aad:runtime", opt);
+    std::cout << "Runtime: " << runtime_plain.c_str() << "\n";
+
+    // Example: rekey to rotate to a new key provider.
+    auto provider2 = std::make_shared<PasswordKeyProvider>(
+        std::string(pass),
+        salt,
+        nigelcrypt_packed::secret_iterations,
+        2
+    );
+    runtime_secret.rekey(provider2, "aad:runtime", Algorithm::Aes256Gcm, RuntimeBinding::Process);
     return 0;
 }

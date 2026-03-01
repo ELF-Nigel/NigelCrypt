@@ -74,7 +74,7 @@ secret.txt
 ### 2) Run the packer (on Windows)
 ```
 set NIGELCRYPT_PASSPHRASE=your-strong-passphrase
-nigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE --binding none --iterations 600000 --meta-hex 4e6967656c4372797074
+nigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE --binding none --iterations 1000000 --meta-hex 4e6967656c4372797074
 ```
 
 This generates `packed/secret_blob.hpp` containing only ciphertext, salt, iteration count, and key id.
@@ -235,6 +235,17 @@ auto plain = s.decrypt("api:v1", opt);
 ```
 
 `BufferMode::VirtualLocked` (default) uses `VirtualLock` when possible. If locking fails, it falls back to an unlocked allocation.
+
+### Hardened Defaults
+You can opt into stricter defaults:
+
+```cpp
+auto policy = nigelcrypt::hardened_policy();
+nigelcrypt::set_policy(policy);
+
+auto opt = nigelcrypt::hardened_decrypt_options();
+auto plain = s.decrypt("aad:packed", opt);
+```
 
 ## Envelope Export/Import
 Persist encrypted data as a self-describing envelope:

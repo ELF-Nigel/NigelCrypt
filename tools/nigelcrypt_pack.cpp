@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
     std::string salt_hex;
     std::string meta_hex;
     std::string binding = "none";
-    uint32_t iterations = 600000;
+    uint32_t iterations = 1000000;
     uint32_t key_id = 1;
 
     for (int i = 1; i < argc; ++i) {
