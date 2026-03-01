@@ -1,4 +1,4 @@
-#include "../nigelcrypt.hpp"
+#include "nigelcrypt/nigelcrypt.hpp"
 
 #include <fstream>
 #include <iostream>

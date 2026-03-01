@@ -1,4 +1,4 @@
-#include "nigelcrypt.hpp"
+#include "nigelcrypt/nigelcrypt.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -38,6 +38,12 @@ int main() {
 
 
     // Optional policy enforcement.
+    nigelcrypt::RegionPolicy rp;
+    rp.enable = false;
+    rp.resolver = []() { return std::string("US"); };
+    rp.allowlist = {"US"};
+    nigelcrypt::set_region_policy(rp);
+
     nigelcrypt::Policy policy;
     policy.require_aad = false;
     policy.require_algorithm = true;

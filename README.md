@@ -24,6 +24,24 @@ Header-only, Windows-only string protection utility focused on **real authentica
 - Not a replacement for secure server-side secret storage.
 
 ## Requirements
+
+## SDK / Library Usage
+Build with CMake to get static/shared libs or use header-only target:
+
+```
+cmake -S . -B build -DNIGELCRYPT_BUILD_SHARED=ON -DNIGELCRYPT_BUILD_STATIC=ON
+cmake --build build --config Release
+```
+
+CMake targets:
+- `nigelcrypt_static`
+- `nigelcrypt_shared`
+- `nigelcrypt_header` (header-only)
+
+Include header:
+```cpp
+#include "nigelcrypt/nigelcrypt.hpp"
+```
 - Windows (user-mode)
 - C++20
 - Windows CNG / DPAPI
@@ -32,7 +50,7 @@ Header-only, Windows-only string protection utility focused on **real authentica
 ## Quick Start
 
 ```cpp
-#include "nigelcrypt.hpp"
+#include "nigelcrypt/nigelcrypt.hpp"
 
 int main() {
     using nigelcrypt::SecureString;
@@ -175,6 +193,20 @@ Do not use process binding for build-time packed blobs, because the packer runs 
 
 
 ## Policy (App-Specific Rules)
+
+## Region Policy (Optional)
+Region policy is **application-defined**. You provide a resolver that returns a region string (e.g., "US"). This is suitable for licensing (best-effort).
+
+```cpp
+nigelcrypt::RegionPolicy rp;
+rp.enable = true;
+rp.resolver = []() { return std::string("US"); };
+rp.allowlist = {"US", "CA"};
+// or use blocklist: rp.blocklist = {"RU"};
+nigelcrypt::set_region_policy(rp);
+```
+
+If the resolver says the region is blocked or not allowed, decryption fails.
 You can enforce app-specific rules at runtime:
 
 ```cpp

@@ -31,6 +31,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -83,6 +84,23 @@ inline Policy& default_policy() {
 
 inline void set_policy(const Policy& policy) {
     default_policy() = policy;
+}
+
+struct RegionPolicy {
+    bool enable = false;
+    std::vector<std::string> allowlist;
+    std::vector<std::string> blocklist;
+    // If set, the app provides a region string (e.g., "US", "DE").
+    std::function<std::string()> resolver;
+};
+
+inline RegionPolicy& region_policy() {
+    static RegionPolicy p{};
+    return p;
+}
+
+inline void set_region_policy(const RegionPolicy& p) {
+    region_policy() = p;
 }
 
 namespace detail {
@@ -916,6 +934,8 @@ inline KeyRing& key_ring() {
     return detail::default_key_ring();
 }
 
+const char* version_string();
+
 class SecureStringView {
 public:
     SecureStringView() = default;
@@ -1027,6 +1047,7 @@ public:
 
     SecureStringView decrypt(std::string_view aad, const DecryptOptions& options) const {
         const Policy& pol = default_policy();
+        const RegionPolicy& rp = region_policy();
         if (options.require_aad || pol.require_aad) {
             if (aad.empty()) {
                 throw std::runtime_error("AAD is required for decryption");
@@ -1040,6 +1061,31 @@ public:
         }
         if (pol.min_key_id && key_id_ < pol.min_key_id) {
             throw std::runtime_error("Key id does not satisfy policy");
+        }
+        if (rp.enable) {
+            if (!rp.resolver) {
+                throw std::runtime_error("Region policy enabled but no resolver provided");
+            }
+            const std::string region = rp.resolver();
+            if (!rp.blocklist.empty()) {
+                for (const auto& b : rp.blocklist) {
+                    if (region == b) {
+                        throw std::runtime_error("Region is blocked by policy");
+                    }
+                }
+            }
+            if (!rp.allowlist.empty()) {
+                bool allowed = false;
+                for (const auto& a : rp.allowlist) {
+                    if (region == a) {
+                        allowed = true;
+                        break;
+                    }
+                }
+                if (!allowed) {
+                    throw std::runtime_error("Region is not allowed by policy");
+                }
+            }
         }
         if (ciphertext_.empty()) {
             return SecureStringView(detail::BufferAlloc{});
