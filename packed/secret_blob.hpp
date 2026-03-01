@@ -10,4 +10,5 @@ inline constexpr std::array<uint8_t, 16> secret_salt = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 };
 inline constexpr std::array<uint8_t, 0> secret_blob = {};
+// Optional custom metadata is carried inside the envelope when generated.
 } // namespace nigelcrypt_packed

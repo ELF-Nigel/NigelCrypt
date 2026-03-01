@@ -66,6 +66,25 @@ struct DecryptOptions {
     bool require_aad = false;
 };
 
+
+struct Policy {
+    Algorithm required_algorithm = Algorithm::Aes256Gcm;
+    bool require_algorithm = false;
+    bool require_aad = false;
+    RuntimeBinding required_binding = RuntimeBinding::None;
+    bool require_binding = false;
+    uint32_t min_key_id = 0;
+};
+
+inline Policy& default_policy() {
+    static Policy p{};
+    return p;
+}
+
+inline void set_policy(const Policy& policy) {
+    default_policy() = policy;
+}
+
 namespace detail {
 
 inline void secure_zero(void* ptr, size_t len) {
@@ -974,11 +993,13 @@ public:
             tag_ = other.tag_;
             salt_ = other.salt_;
             context_ = other.context_;
+            custom_meta_ = std::move(other.custom_meta_);
             other.ciphertext_.clear();
             other.nonce_.fill(0);
             other.tag_.fill(0);
             other.salt_.fill(0);
             other.context_.fill(0);
+            other.custom_meta_.clear();
             other.binding_ = RuntimeBinding::Process;
         }
         return *this;
@@ -1005,8 +1026,20 @@ public:
     }
 
     SecureStringView decrypt(std::string_view aad, const DecryptOptions& options) const {
-        if (options.require_aad && aad.empty()) {
-            throw std::runtime_error("AAD is required for decryption");
+        const Policy& pol = default_policy();
+        if (options.require_aad || pol.require_aad) {
+            if (aad.empty()) {
+                throw std::runtime_error("AAD is required for decryption");
+            }
+        }
+        if (pol.require_algorithm && algorithm_ != pol.required_algorithm) {
+            throw std::runtime_error("Algorithm does not satisfy policy");
+        }
+        if (pol.require_binding && binding_ != pol.required_binding) {
+            throw std::runtime_error("Binding does not satisfy policy");
+        }
+        if (pol.min_key_id && key_id_ < pol.min_key_id) {
+            throw std::runtime_error("Key id does not satisfy policy");
         }
         if (ciphertext_.empty()) {
             return SecureStringView(detail::BufferAlloc{});
@@ -1110,14 +1143,25 @@ public:
         encrypt_with_provider(std::string_view(plain.c_str(), plain.size()), aad, alg, binding, provider);
     }
 
+
+    void set_custom_meta(std::vector<uint8_t> meta) {
+        custom_meta_ = std::move(meta);
+    }
+
+    const std::vector<uint8_t>& custom_meta() const {
+        return custom_meta_;
+    }
+
     std::vector<uint8_t> export_envelope() const {
         static constexpr uint32_t kMagic = 0x5243474E; // 'NGCR'
         const bool v2 = version_ >= 2;
-        const size_t header = v2 ? (4 + 2 + 2 + 2 + 4 + 4) : (4 + 2 + 2 + 4 + 4);
-        const size_t meta_len = v2 ? 32 : 0;
+        const bool v3 = version_ >= 3;
+        const size_t header = v3 ? (4 + 2 + 2 + 2 + 4 + 4 + 2) : (v2 ? (4 + 2 + 2 + 2 + 4 + 4) : (4 + 2 + 2 + 4 + 4));
+        const size_t meta_len = v3 ? custom_meta_.size() : 0;
+        const size_t hash_len = v2 ? 32 : 0;
 
         std::vector<uint8_t> out;
-        out.reserve(header + 16 + 12 + 16 + 16 + meta_len + ciphertext_.size());
+        out.reserve(header + 16 + 12 + 16 + 16 + meta_len + hash_len + ciphertext_.size());
 
         detail::append_u32(out, kMagic);
         detail::append_u16(out, static_cast<uint16_t>(version_));
@@ -1127,24 +1171,36 @@ public:
         }
         detail::append_u32(out, key_id_);
         detail::append_u32(out, static_cast<uint32_t>(ciphertext_.size()));
+        if (v3) {
+            detail::append_u16(out, static_cast<uint16_t>(custom_meta_.size()));
+        }
 
         out.insert(out.end(), salt_.begin(), salt_.end());
         out.insert(out.end(), nonce_.begin(), nonce_.end());
         out.insert(out.end(), context_.begin(), context_.end());
         out.insert(out.end(), tag_.begin(), tag_.end());
+        if (v3 && !custom_meta_.empty()) {
+            out.insert(out.end(), custom_meta_.begin(), custom_meta_.end());
+        }
 
         if (v2) {
             std::vector<uint8_t> meta;
-            meta.reserve(2 + 2 + 2 + 4 + 4 + salt_.size() + nonce_.size() + context_.size() + tag_.size());
+            meta.reserve(2 + 2 + 2 + 4 + 4 + 2 + salt_.size() + nonce_.size() + context_.size() + tag_.size() + custom_meta_.size());
             detail::append_u16(meta, static_cast<uint16_t>(version_));
             detail::append_u16(meta, static_cast<uint16_t>(algorithm_));
             detail::append_u16(meta, static_cast<uint16_t>(binding_));
             detail::append_u32(meta, key_id_);
             detail::append_u32(meta, static_cast<uint32_t>(ciphertext_.size()));
+            if (v3) {
+                detail::append_u16(meta, static_cast<uint16_t>(custom_meta_.size()));
+            }
             meta.insert(meta.end(), salt_.begin(), salt_.end());
             meta.insert(meta.end(), nonce_.begin(), nonce_.end());
             meta.insert(meta.end(), context_.begin(), context_.end());
             meta.insert(meta.end(), tag_.begin(), tag_.end());
+            if (v3 && !custom_meta_.empty()) {
+                meta.insert(meta.end(), custom_meta_.begin(), custom_meta_.end());
+            }
 
             std::vector<uint8_t> meta_hash = detail::sha256(std::move(meta));
             out.insert(out.end(), meta_hash.begin(), meta_hash.end());
@@ -1171,26 +1227,31 @@ public:
         uint16_t binding = static_cast<uint16_t>(RuntimeBinding::None);
         uint32_t key_id = 0;
         uint32_t ciphertext_len = 0;
+        uint16_t meta_len = 0;
 
         if (version == 1) {
-            if (data.size() < 4 + 2 + 2 + 4 + 4) {
-                throw std::runtime_error("Envelope too small");
-            }
             alg = detail::read_u16(data, off);
             key_id = detail::read_u32(data, off);
             ciphertext_len = detail::read_u32(data, off);
-        } else {
-            if (data.size() < 4 + 2 + 2 + 2 + 4 + 4) {
-                throw std::runtime_error("Envelope too small");
-            }
+        } else if (version == 2) {
             alg = detail::read_u16(data, off);
             binding = detail::read_u16(data, off);
             key_id = detail::read_u32(data, off);
             ciphertext_len = detail::read_u32(data, off);
+        } else {
+            alg = detail::read_u16(data, off);
+            binding = detail::read_u16(data, off);
+            key_id = detail::read_u32(data, off);
+            ciphertext_len = detail::read_u32(data, off);
+            meta_len = detail::read_u16(data, off);
         }
 
         const bool v2 = version >= 2;
-        const size_t fixed = (version == 1 ? (4 + 2 + 2 + 4 + 4) : (4 + 2 + 2 + 2 + 4 + 4)) + 16 + 12 + 16 + 16 + (v2 ? 32 : 0);
+        const bool v3 = version >= 3;
+        const size_t fixed = (version == 1 ? (4 + 2 + 2 + 4 + 4)
+                          : (version == 2 ? (4 + 2 + 2 + 2 + 4 + 4)
+                                          : (4 + 2 + 2 + 2 + 4 + 4 + 2)))
+                           + 16 + 12 + 16 + 16 + (v3 ? meta_len : 0) + (v2 ? 32 : 0);
         if (data.size() < fixed) {
             throw std::runtime_error("Envelope missing fields");
         }
@@ -1215,22 +1276,33 @@ public:
         std::memcpy(s.tag_.data(), data.data() + off, s.tag_.size());
         off += s.tag_.size();
 
+        if (v3 && meta_len) {
+            s.custom_meta_.assign(data.begin() + int(off), data.begin() + int(off + meta_len));
+            off += meta_len;
+        }
+
         if (v2) {
             std::vector<uint8_t> meta_hash(32);
             std::memcpy(meta_hash.data(), data.data() + off, meta_hash.size());
             off += meta_hash.size();
 
             std::vector<uint8_t> meta;
-            meta.reserve(2 + 2 + 2 + 4 + 4 + s.salt_.size() + s.nonce_.size() + s.context_.size() + s.tag_.size());
+            meta.reserve(2 + 2 + 2 + 4 + 4 + 2 + s.salt_.size() + s.nonce_.size() + s.context_.size() + s.tag_.size() + s.custom_meta_.size());
             detail::append_u16(meta, static_cast<uint16_t>(version));
             detail::append_u16(meta, static_cast<uint16_t>(alg));
             detail::append_u16(meta, static_cast<uint16_t>(binding));
             detail::append_u32(meta, key_id);
             detail::append_u32(meta, ciphertext_len);
+            if (v3) {
+                detail::append_u16(meta, meta_len);
+            }
             meta.insert(meta.end(), s.salt_.begin(), s.salt_.end());
             meta.insert(meta.end(), s.nonce_.begin(), s.nonce_.end());
             meta.insert(meta.end(), s.context_.begin(), s.context_.end());
             meta.insert(meta.end(), s.tag_.begin(), s.tag_.end());
+            if (v3 && !s.custom_meta_.empty()) {
+                meta.insert(meta.end(), s.custom_meta_.begin(), s.custom_meta_.end());
+            }
 
             std::vector<uint8_t> computed = detail::sha256(std::move(meta));
             if (computed != meta_hash) {
@@ -1253,6 +1325,10 @@ public:
         detail::secure_zero(tag_.data(), tag_.size());
         detail::secure_zero(salt_.data(), salt_.size());
         detail::secure_zero(context_.data(), context_.size());
+        if (!custom_meta_.empty()) {
+            detail::secure_zero(custom_meta_.data(), custom_meta_.size());
+            custom_meta_.clear();
+        }
     }
 
 private:

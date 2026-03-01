@@ -56,7 +56,7 @@ secret.txt
 ### 2) Run the packer (on Windows)
 ```
 set NIGELCRYPT_PASSPHRASE=your-strong-passphrase
-nigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE --binding none --iterations 600000
+nigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE --binding none --iterations 600000 --meta-hex 4e6967656c4372797074
 ```
 
 This generates `packed/secret_blob.hpp` containing only ciphertext, salt, iteration count, and key id.
@@ -90,6 +90,20 @@ auto plain = s.decrypt();
 $env:NIGELCRYPT_PASSPHRASE = "your-strong-passphrase"
 .\tools\pack_sample.ps1 -PlaintextPath .\secret.txt
 ```
+
+
+## Custom Metadata (Uniqueness)
+You can embed custom, application-specific metadata into the envelope. This keeps the crypto standard while making your envelope format unique to your app.
+
+```cpp
+// Set custom metadata before encrypting
+std::vector<uint8_t> meta = {0x4E,0x69,0x67,0x65,0x6C,0x43,0x72,0x79,0x70,0x74}; // "NigelCrypt"
+SecureString s;
+s.set_custom_meta(meta);
+s.encrypt("runtime-only", {}, Algorithm::Aes256Gcm, RuntimeBinding::Process);
+```
+
+This metadata is included in the envelope and integrity-hashed.
 
 ## Algorithm Selection
 Choose AES-256-GCM (default) or ChaCha20-Poly1305:
@@ -158,6 +172,24 @@ SecureString s("runtime-only", {}, Algorithm::Aes256Gcm, RuntimeBinding::Process
 ```
 
 Do not use process binding for build-time packed blobs, because the packer runs in a different process.
+
+
+## Policy (App-Specific Rules)
+You can enforce app-specific rules at runtime:
+
+```cpp
+nigelcrypt::Policy p;
+p.require_aad = true;
+p.require_algorithm = true;
+p.required_algorithm = nigelcrypt::Algorithm::Aes256Gcm;
+p.require_binding = true;
+p.required_binding = nigelcrypt::RuntimeBinding::Process;
+p.min_key_id = 2;
+
+nigelcrypt::set_policy(p);
+```
+
+Decryption will fail if the policy is not satisfied.
 
 ## Decrypt Options (Memory Hardening)
 You can control how plaintext buffers are allocated and whether AAD is required:

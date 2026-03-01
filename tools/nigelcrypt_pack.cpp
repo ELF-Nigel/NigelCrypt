@@ -17,6 +17,7 @@ static void usage() {
         << "  --iterations <n>          PBKDF2 iterations (default: 600000)\n"
         << "  --key-id <n>              Key id stored in envelope (default: 1)\n"
         << "  --salt-hex <hex>          16-byte salt in hex (default: random)\n"
+        << "  --meta-hex <hex>          Optional custom metadata (hex)\n"
         << "  --binding <none|process>  Runtime binding mode (default: none)\n"
         << "\nNotes:\n"
         << "- Passphrase is read from environment via --pass-env. Avoid passing on the command line.\n"
@@ -97,6 +98,7 @@ int main(int argc, char** argv) {
     std::string aad;
     std::string alg = "aes";
     std::string salt_hex;
+    std::string meta_hex;
     std::string binding = "none";
     uint32_t iterations = 600000;
     uint32_t key_id = 1;
@@ -119,6 +121,7 @@ int main(int argc, char** argv) {
         else if (arg == "--iterations") iterations = static_cast<uint32_t>(std::stoul(need("--iterations")));
         else if (arg == "--key-id") key_id = static_cast<uint32_t>(std::stoul(need("--key-id")));
         else if (arg == "--salt-hex") salt_hex = need("--salt-hex");
+        else if (arg == "--meta-hex") meta_hex = need("--meta-hex");
         else if (arg == "--binding") binding = need("--binding");
         else if (arg == "--help" || arg == "-h") {
             usage();
@@ -176,7 +179,14 @@ int main(int argc, char** argv) {
     auto provider = std::make_shared<nigelcrypt::PasswordKeyProvider>(passphrase, salt, iterations, key_id);
     nigelcrypt::set_key_provider(provider);
 
-    nigelcrypt::SecureString s(plaintext, aad, algorithm, bind);
+    std::vector<uint8_t> custom_meta;
+    if (!meta_hex.empty()) {
+        custom_meta = hex_to_bytes(meta_hex);
+    }
+
+    nigelcrypt::SecureString s;
+    s.set_custom_meta(std::move(custom_meta));
+    s.encrypt(plaintext, aad, algorithm, bind);
     auto blob = s.export_envelope();
 
     write_header(out_path, name, blob, salt, iterations, key_id);

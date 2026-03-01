@@ -36,6 +36,16 @@ int main() {
         return 1;
     }
 
+
+    // Optional policy enforcement.
+    nigelcrypt::Policy policy;
+    policy.require_aad = false;
+    policy.require_algorithm = true;
+    policy.required_algorithm = nigelcrypt::Algorithm::Aes256Gcm;
+    policy.require_binding = false;
+    policy.min_key_id = 1;
+    nigelcrypt::set_policy(policy);
+
     // Configure key provider from the generated header parameters.
     std::vector<uint8_t> salt(
         nigelcrypt_packed::secret_salt.begin(),
