@@ -26,10 +26,12 @@
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -37,6 +39,7 @@
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
 
 namespace nigelcrypt {
 
@@ -77,6 +80,46 @@ public:
 private:
     BCRYPT_ALG_HANDLE handle_ = nullptr;
 };
+
+inline std::vector<uint8_t> sha256(std::vector<uint8_t> data) {
+    BcryptAlgHandle alg(BCRYPT_SHA256_ALGORITHM, 0);
+
+    DWORD hash_len = 0;
+    DWORD cb = 0;
+    NTSTATUS st = BCryptGetProperty(alg.get(), BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len), sizeof(hash_len), &cb, 0);
+    if (st < 0) {
+        throw_status("BCryptGetProperty(HASH_LENGTH) failed", st);
+    }
+
+    std::vector<uint8_t> hash_obj;
+    DWORD obj_len = 0;
+    st = BCryptGetProperty(alg.get(), BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_len), sizeof(obj_len), &cb, 0);
+    if (st < 0) {
+        throw_status("BCryptGetProperty(OBJECT_LENGTH) failed", st);
+    }
+    hash_obj.resize(obj_len);
+
+    BCRYPT_HASH_HANDLE h = nullptr;
+    st = BCryptCreateHash(alg.get(), &h, hash_obj.data(), obj_len, nullptr, 0, 0);
+    if (st < 0) {
+        throw_status("BCryptCreateHash failed", st);
+    }
+
+    st = BCryptHashData(h, data.data(), static_cast<ULONG>(data.size()), 0);
+    if (st < 0) {
+        BCryptDestroyHash(h);
+        throw_status("BCryptHashData failed", st);
+    }
+
+    std::vector<uint8_t> out(hash_len);
+    st = BCryptFinishHash(h, out.data(), static_cast<ULONG>(out.size()), 0);
+    BCryptDestroyHash(h);
+    if (st < 0) {
+        throw_status("BCryptFinishHash failed", st);
+    }
+
+    return out;
+}
 
 inline void gen_random(uint8_t* out, size_t len) {
     if (!out || len == 0) return;
@@ -160,25 +203,130 @@ inline std::vector<uint8_t> hkdf_sha256(
     return okm;
 }
 
-class MasterKey {
+class KeyBlob {
 public:
-    static const std::array<uint8_t, 32>& get() {
-        static MasterKey inst;
-        return inst.key_;
+    KeyBlob() = default;
+    explicit KeyBlob(const std::array<uint8_t, 32>& v) : bytes(v) {}
+
+    KeyBlob(const KeyBlob&) = delete;
+    KeyBlob& operator=(const KeyBlob&) = delete;
+
+    KeyBlob(KeyBlob&& other) noexcept {
+        bytes = other.bytes;
+        secure_zero(other.bytes.data(), other.bytes.size());
+    }
+
+    KeyBlob& operator=(KeyBlob&& other) noexcept {
+        if (this != &other) {
+            secure_zero(bytes.data(), bytes.size());
+            bytes = other.bytes;
+            secure_zero(other.bytes.data(), other.bytes.size());
+        }
+        return *this;
+    }
+
+    ~KeyBlob() { secure_zero(bytes.data(), bytes.size()); }
+
+    std::array<uint8_t, 32> bytes{};
+};
+
+enum class KeyScope {
+    CurrentUser,
+    LocalMachine
+};
+
+class KeyProvider {
+public:
+    virtual ~KeyProvider() = default;
+    virtual KeyBlob get_master_key() = 0;
+};
+
+class DpapiKeyProvider final : public KeyProvider {
+public:
+    explicit DpapiKeyProvider(KeyScope scope = KeyScope::CurrentUser, bool use_entropy = true)
+        : scope_(scope), use_entropy_(use_entropy) {
+        std::array<uint8_t, 32> raw{};
+        gen_random(raw.data(), raw.size());
+
+        if (use_entropy_) {
+            entropy_.resize(16);
+            gen_random(entropy_.data(), entropy_.size());
+        }
+
+        DATA_BLOB input{};
+        input.pbData = raw.data();
+        input.cbData = static_cast<DWORD>(raw.size());
+
+        DATA_BLOB entropy{};
+        entropy.pbData = use_entropy_ ? entropy_.data() : nullptr;
+        entropy.cbData = use_entropy_ ? static_cast<DWORD>(entropy_.size()) : 0;
+
+        DATA_BLOB output{};
+        DWORD flags = (scope_ == KeyScope::LocalMachine) ? CRYPTPROTECT_LOCAL_MACHINE : 0;
+
+        if (!CryptProtectData(&input, L"NigelCryptKey", use_entropy_ ? &entropy : nullptr, nullptr, nullptr, flags, &output)) {
+            throw std::runtime_error("CryptProtectData failed");
+        }
+
+        wrapped_.assign(output.pbData, output.pbData + output.cbData);
+        LocalFree(output.pbData);
+
+        secure_zero(raw.data(), raw.size());
+    }
+
+    KeyBlob get_master_key() override {
+        std::lock_guard<std::mutex> lock(mu_);
+
+        DATA_BLOB input{};
+        input.pbData = wrapped_.data();
+        input.cbData = static_cast<DWORD>(wrapped_.size());
+
+        DATA_BLOB entropy{};
+        entropy.pbData = use_entropy_ ? entropy_.data() : nullptr;
+        entropy.cbData = use_entropy_ ? static_cast<DWORD>(entropy_.size()) : 0;
+
+        DATA_BLOB output{};
+        if (!CryptUnprotectData(&input, nullptr, use_entropy_ ? &entropy : nullptr, nullptr, nullptr, 0, &output)) {
+            throw std::runtime_error("CryptUnprotectData failed");
+        }
+
+        if (output.cbData != 32) {
+            LocalFree(output.pbData);
+            throw std::runtime_error("Unexpected DPAPI key size");
+        }
+
+        std::array<uint8_t, 32> key{};
+        std::memcpy(key.data(), output.pbData, 32);
+        LocalFree(output.pbData);
+
+        return KeyBlob(key);
     }
 
 private:
-    MasterKey() {
-        gen_random(key_.data(), key_.size());
-    }
-
-    std::array<uint8_t, 32> key_{};
+    KeyScope scope_;
+    bool use_entropy_;
+    std::vector<uint8_t> wrapped_;
+    std::vector<uint8_t> entropy_;
+    std::mutex mu_;
 };
+
+inline std::shared_ptr<KeyProvider>& default_key_provider() {
+    static std::shared_ptr<KeyProvider> provider = std::make_shared<DpapiKeyProvider>();
+    return provider;
+}
+
+inline void set_default_key_provider(std::shared_ptr<KeyProvider> provider) {
+    if (!provider) {
+        throw std::invalid_argument("KeyProvider cannot be null");
+    }
+    default_key_provider() = std::move(provider);
+}
 
 inline void aes256_gcm_encrypt(
     const uint8_t* key, size_t key_len,
     const uint8_t* plaintext, size_t plaintext_len,
     const uint8_t* nonce, size_t nonce_len,
+    const uint8_t* aad, size_t aad_len,
     std::vector<uint8_t>& ciphertext,
     std::array<uint8_t, 16>& tag
 ) {
@@ -207,6 +355,8 @@ inline void aes256_gcm_encrypt(
     BCRYPT_INIT_AUTH_MODE_INFO(info);
     info.pbNonce = const_cast<PUCHAR>(nonce);
     info.cbNonce = static_cast<ULONG>(nonce_len);
+    info.pbAuthData = const_cast<PUCHAR>(aad);
+    info.cbAuthData = static_cast<ULONG>(aad_len);
     info.pbTag = tag.data();
     info.cbTag = static_cast<ULONG>(tag.size());
 
@@ -238,6 +388,7 @@ inline std::vector<uint8_t> aes256_gcm_decrypt(
     const uint8_t* key, size_t key_len,
     const uint8_t* ciphertext, size_t ciphertext_len,
     const uint8_t* nonce, size_t nonce_len,
+    const uint8_t* aad, size_t aad_len,
     const std::array<uint8_t, 16>& tag
 ) {
     BcryptAlgHandle alg(BCRYPT_AES_ALGORITHM, 0);
@@ -265,6 +416,8 @@ inline std::vector<uint8_t> aes256_gcm_decrypt(
     BCRYPT_INIT_AUTH_MODE_INFO(info);
     info.pbNonce = const_cast<PUCHAR>(nonce);
     info.cbNonce = static_cast<ULONG>(nonce_len);
+    info.pbAuthData = const_cast<PUCHAR>(aad);
+    info.cbAuthData = static_cast<ULONG>(aad_len);
     info.pbTag = const_cast<PUCHAR>(tag.data());
     info.cbTag = static_cast<ULONG>(tag.size());
 
@@ -294,6 +447,15 @@ inline std::vector<uint8_t> aes256_gcm_decrypt(
 }
 
 } // namespace detail
+
+using KeyProvider = detail::KeyProvider;
+using KeyBlob = detail::KeyBlob;
+using DpapiKeyProvider = detail::DpapiKeyProvider;
+using KeyScope = detail::KeyScope;
+
+inline void set_key_provider(std::shared_ptr<KeyProvider> provider) {
+    detail::set_default_key_provider(std::move(provider));
+}
 
 class SecureStringView {
 public:
@@ -343,8 +505,8 @@ class SecureString {
 public:
     SecureString() = default;
 
-    explicit SecureString(std::string_view plain) {
-        encrypt(plain);
+    explicit SecureString(std::string_view plain, std::string_view aad = {}) {
+        encrypt(plain, aad);
     }
 
     SecureString(const SecureString&) = delete;
@@ -371,15 +533,20 @@ public:
 
     ~SecureString() { clear(); }
 
-    void encrypt(std::string_view plain) {
+    void encrypt(std::string_view plain, std::string_view aad = {}) {
         clear();
 
         detail::gen_random(salt_.data(), salt_.size());
         detail::gen_random(nonce_.data(), nonce_.size());
+        detail::gen_random(context_.data(), context_.size());
 
-        std::vector<uint8_t> ikm(detail::MasterKey::get().begin(), detail::MasterKey::get().end());
+        detail::KeyBlob master = detail::default_key_provider()->get_master_key();
+        std::vector<uint8_t> ikm(master.bytes.begin(), master.bytes.end());
         std::vector<uint8_t> salt(salt_.begin(), salt_.end());
-        std::vector<uint8_t> info(nonce_.begin(), nonce_.end());
+        std::vector<uint8_t> info;
+        info.reserve(nonce_.size() + context_.size());
+        info.insert(info.end(), nonce_.begin(), nonce_.end());
+        info.insert(info.end(), context_.begin(), context_.end());
 
         std::vector<uint8_t> key = detail::hkdf_sha256(std::move(ikm), std::move(salt), std::move(info), 32);
 
@@ -387,6 +554,7 @@ public:
             key.data(), key.size(),
             reinterpret_cast<const uint8_t*>(plain.data()), plain.size(),
             nonce_.data(), nonce_.size(),
+            reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
             ciphertext_,
             tag_
         );
@@ -394,14 +562,18 @@ public:
         detail::secure_zero(key.data(), key.size());
     }
 
-    SecureStringView decrypt() const {
+    SecureStringView decrypt(std::string_view aad = {}) const {
         if (ciphertext_.empty()) {
             return SecureStringView(nullptr, 0);
         }
 
-        std::vector<uint8_t> ikm(detail::MasterKey::get().begin(), detail::MasterKey::get().end());
+        detail::KeyBlob master = detail::default_key_provider()->get_master_key();
+        std::vector<uint8_t> ikm(master.bytes.begin(), master.bytes.end());
         std::vector<uint8_t> salt(salt_.begin(), salt_.end());
-        std::vector<uint8_t> info(nonce_.begin(), nonce_.end());
+        std::vector<uint8_t> info;
+        info.reserve(nonce_.size() + context_.size());
+        info.insert(info.end(), nonce_.begin(), nonce_.end());
+        info.insert(info.end(), context_.begin(), context_.end());
 
         std::vector<uint8_t> key = detail::hkdf_sha256(std::move(ikm), std::move(salt), std::move(info), 32);
 
@@ -409,6 +581,7 @@ public:
             key.data(), key.size(),
             ciphertext_.data(), ciphertext_.size(),
             nonce_.data(), nonce_.size(),
+            reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
             tag_
         );
 
@@ -432,6 +605,7 @@ public:
         detail::secure_zero(nonce_.data(), nonce_.size());
         detail::secure_zero(tag_.data(), tag_.size());
         detail::secure_zero(salt_.data(), salt_.size());
+        detail::secure_zero(context_.data(), context_.size());
     }
 
 private:
@@ -439,7 +613,7 @@ private:
     std::array<uint8_t, 12> nonce_{}; // 96-bit nonce for GCM
     std::array<uint8_t, 16> tag_{};   // 128-bit tag
     std::array<uint8_t, 16> salt_{};  // per-string salt for HKDF
+    std::array<uint8_t, 16> context_{}; // per-string HKDF context
 };
 
 } // namespace nigelcrypt
-
