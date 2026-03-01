@@ -151,4 +151,4 @@ auto p = s2.decrypt();
 - `nigelcrypt.hpp` – the full implementation.
 
 ## License
-Add your preferred license text here.
+This is a github template, there was no assigned license.
