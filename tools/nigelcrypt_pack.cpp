@@ -14,7 +14,7 @@ static void usage() {
         << "Options:\n"
         << "  --alg <aes|chacha>        Algorithm (default: aes)\n"
         << "  --aad <text>              Optional associated data\n"
-        << "  --iterations <n>          PBKDF2 iterations (default: 200000)\n"
+        << "  --iterations <n>          PBKDF2 iterations (default: 600000)\n"
         << "  --key-id <n>              Key id stored in envelope (default: 1)\n"
         << "  --salt-hex <hex>          16-byte salt in hex (default: random)\n"
         << "  --binding <none|process>  Runtime binding mode (default: none)\n"
@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
     std::string alg = "aes";
     std::string salt_hex;
     std::string binding = "none";
-    uint32_t iterations = 200000;
+    uint32_t iterations = 600000;
     uint32_t key_id = 1;
 
     for (int i = 1; i < argc; ++i) {

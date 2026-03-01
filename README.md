@@ -16,6 +16,7 @@ Header-only, Windows-only string protection utility focused on **real authentica
 - Versioned envelope export/import for storage and key rotation.
 - Optional build-time packing to keep plaintext out of your binary.
 - Optional runtime binding to process context for stronger in-memory protection.
+- Hardened plaintext buffers (VirtualLock/guard-page) with configurable options.
 
 ## What This Is Not
 - Not anti-debugging, anti-tamper, or polymorphic obfuscation.
@@ -55,7 +56,7 @@ secret.txt
 ### 2) Run the packer (on Windows)
 ```
 set NIGELCRYPT_PASSPHRASE=your-strong-passphrase
-nigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE --binding none
+nigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE --binding none --iterations 600000
 ```
 
 This generates `packed/secret_blob.hpp` containing only ciphertext, salt, iteration count, and key id.
@@ -146,6 +147,7 @@ nigelcrypt::set_key_provider(std::make_shared<MyProvider>());
 ```
 
 Note: ChaCha20-Poly1305 requires a Windows version that exposes the CNG algorithm `BCRYPT_CHACHA20_POLY1305_ALGORITHM`.
+Note: `PasswordKeyProvider` enforces a minimum of 100,000 PBKDF2 iterations.
 
 ## Runtime Binding
 For in-memory strings created at runtime, you can bind encryption to the current process. This makes ciphertext invalid if moved to another process.
@@ -156,6 +158,19 @@ SecureString s("runtime-only", {}, Algorithm::Aes256Gcm, RuntimeBinding::Process
 ```
 
 Do not use process binding for build-time packed blobs, because the packer runs in a different process.
+
+## Decrypt Options (Memory Hardening)
+You can control how plaintext buffers are allocated and whether AAD is required:
+
+```cpp
+nigelcrypt::DecryptOptions opt;
+opt.buffer = nigelcrypt::BufferMode::VirtualGuarded; // adds a guard page
+opt.require_aad = true; // refuse decrypt if AAD is empty
+
+auto plain = s.decrypt("api:v1", opt);
+```
+
+`BufferMode::VirtualLocked` (default) uses `VirtualLock` when possible. If locking fails, it falls back to an unlocked allocation.
 
 ## Envelope Export/Import
 Persist encrypted data as a self-describing envelope:

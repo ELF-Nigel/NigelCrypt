@@ -54,12 +54,115 @@ enum class RuntimeBinding : uint16_t {
     Process = 1
 };
 
+
+enum class BufferMode : uint16_t {
+    Heap = 0,
+    VirtualLocked = 1,
+    VirtualGuarded = 2
+};
+
+struct DecryptOptions {
+    BufferMode buffer = BufferMode::VirtualLocked;
+    bool require_aad = false;
+};
+
 namespace detail {
 
 inline void secure_zero(void* ptr, size_t len) {
     if (ptr && len) {
         ::RtlSecureZeroMemory(ptr, len);
     }
+}
+
+
+struct BufferAlloc {
+    char* ptr = nullptr;
+    void* base = nullptr;
+    size_t len = 0;
+    size_t alloc = 0;
+    size_t lock = 0;
+    BufferMode mode = BufferMode::Heap;
+};
+
+inline size_t page_size() {
+    static size_t ps = 0;
+    if (ps == 0) {
+        SYSTEM_INFO si{};
+        ::GetSystemInfo(&si);
+        ps = static_cast<size_t>(si.dwPageSize);
+    }
+    return ps;
+}
+
+inline BufferAlloc alloc_buffer(size_t len, BufferMode mode) {
+    BufferAlloc b{};
+    b.len = len;
+
+    if (len == 0) {
+        return b;
+    }
+
+    const size_t total_len = len + 1;
+
+    if (mode == BufferMode::Heap) {
+        b.ptr = new char[total_len];
+        b.base = b.ptr;
+        b.alloc = total_len;
+        b.mode = BufferMode::Heap;
+        return b;
+    }
+
+    const size_t ps = page_size();
+    const size_t pages = (total_len + ps - 1) / ps;
+    const size_t total_pages = pages + (mode == BufferMode::VirtualGuarded ? 1 : 0);
+    const size_t total_bytes = total_pages * ps;
+
+    void* base = ::VirtualAlloc(nullptr, total_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!base) {
+        b.ptr = new char[total_len];
+        b.base = b.ptr;
+        b.alloc = total_len;
+        b.mode = BufferMode::Heap;
+        return b;
+    }
+
+    if (mode == BufferMode::VirtualGuarded) {
+        DWORD old_protect = 0;
+        ::VirtualProtect(static_cast<char*>(base) + pages * ps, ps, PAGE_NOACCESS, &old_protect);
+    }
+
+    if (mode == BufferMode::VirtualLocked) {
+        if (::VirtualLock(base, pages * ps)) {
+            b.lock = pages * ps;
+        }
+    }
+
+    b.ptr = static_cast<char*>(base);
+    b.base = base;
+    b.alloc = total_bytes;
+    b.mode = mode;
+    return b;
+}
+
+inline void free_buffer(BufferAlloc& b) {
+    if (!b.ptr) {
+        return;
+    }
+    secure_zero(b.ptr, b.len + 1);
+    if (b.mode == BufferMode::Heap) {
+        delete[] b.ptr;
+    } else {
+        if (b.lock) {
+            ::VirtualUnlock(b.base, b.lock);
+        }
+        ::VirtualFree(b.base, 0, MEM_RELEASE);
+    }
+    b.ptr = nullptr;
+    b.base = nullptr;
+    b.len = 0;
+    b.alloc = 0;
+    b.lock = 0;
+    b.mode = BufferMode::Heap;
 }
 
 inline void throw_status(const char* what, NTSTATUS status) {
@@ -426,8 +529,8 @@ public:
         if (salt_.empty()) {
             throw std::invalid_argument("Salt cannot be empty");
         }
-        if (iterations_ == 0) {
-            throw std::invalid_argument("Iterations must be > 0");
+        if (iterations_ < kMinIterations) {
+            throw std::invalid_argument("Iterations must be >= 100000");
         }
     }
 
@@ -440,6 +543,7 @@ public:
     uint32_t key_id() const override { return key_id_; }
 
 private:
+    static constexpr uint64_t kMinIterations = 100000;
     std::string passphrase_;
     std::vector<uint8_t> salt_;
     uint64_t iterations_;
@@ -795,46 +899,47 @@ inline KeyRing& key_ring() {
 
 class SecureStringView {
 public:
-    SecureStringView(char* ptr, size_t len)
-        : ptr_(ptr), len_(len) {}
+    SecureStringView() = default;
+
+    explicit SecureStringView(detail::BufferAlloc buf)
+        : buf_(buf) {}
 
     SecureStringView(const SecureStringView&) = delete;
     SecureStringView& operator=(const SecureStringView&) = delete;
 
-    SecureStringView(SecureStringView&& other) noexcept
-        : ptr_(other.ptr_), len_(other.len_) {
-        other.ptr_ = nullptr;
-        other.len_ = 0;
+    SecureStringView(SecureStringView&& other) noexcept {
+        *this = std::move(other);
     }
 
     SecureStringView& operator=(SecureStringView&& other) noexcept {
         if (this != &other) {
             reset();
-            ptr_ = other.ptr_;
-            len_ = other.len_;
-            other.ptr_ = nullptr;
-            other.len_ = 0;
+            buf_ = other.buf_;
+            other.buf_.ptr = nullptr;
+            other.buf_.base = nullptr;
+            other.buf_.len = 0;
+            other.buf_.alloc = 0;
+            other.buf_.lock = 0;
+            other.buf_.mode = BufferMode::Heap;
         }
         return *this;
     }
 
     ~SecureStringView() { reset(); }
 
-    const char* c_str() const { return ptr_ ? ptr_ : ""; }
-    size_t size() const { return len_; }
+    const char* c_str() const { return buf_.ptr ? buf_.ptr : ""; }
+    size_t size() const { return buf_.len; }
 
     void reset() {
-        if (ptr_) {
-            detail::secure_zero(ptr_, len_);
-            delete[] ptr_;
-            ptr_ = nullptr;
-            len_ = 0;
-        }
+        detail::free_buffer(buf_);
+    }
+
+    void wipe_now() {
+        reset();
     }
 
 private:
-    char* ptr_ = nullptr;
-    size_t len_ = 0;
+    detail::BufferAlloc buf_{};
 };
 
 class SecureString {
@@ -887,76 +992,24 @@ public:
         Algorithm alg = Algorithm::Aes256Gcm,
         RuntimeBinding binding = RuntimeBinding::Process
     ) {
-        clear();
-
-        version_ = 1;
-        algorithm_ = alg;
-        binding_ = binding;
-
-        detail::gen_random(salt_.data(), salt_.size());
-        detail::gen_random(nonce_.data(), nonce_.size());
-        detail::gen_random(context_.data(), context_.size());
-
         auto provider = detail::default_key_ring().primary();
         if (!provider) {
             throw std::runtime_error("No key provider configured");
         }
-        key_id_ = provider->key_id();
-        detail::KeyBlob master = provider->get_master_key();
-        std::vector<uint8_t> ikm(master.bytes.begin(), master.bytes.end());
-        std::vector<uint8_t> salt(salt_.begin(), salt_.end());
-        std::vector<uint8_t> info;
-        info.reserve(nonce_.size() + context_.size() + 32 + 32);
-        info.insert(info.end(), nonce_.begin(), nonce_.end());
-        info.insert(info.end(), context_.begin(), context_.end());
-
-        std::vector<uint8_t> aad_hash;
-        if (!aad.empty()) {
-            aad_hash = detail::sha256(std::vector<uint8_t>(aad.begin(), aad.end()));
-            info.insert(info.end(), aad_hash.begin(), aad_hash.end());
-        }
-
-        std::vector<uint8_t> binding_bytes = detail::runtime_binding_bytes(binding_);
-        if (!binding_bytes.empty()) {
-            info.insert(info.end(), binding_bytes.begin(), binding_bytes.end());
-        }
-
-        std::vector<uint8_t> key = detail::hkdf_sha256(std::move(ikm), std::move(salt), std::move(info), 32);
-
-        std::vector<uint8_t> auth_data;
-        auth_data.reserve(aad.size() + binding_bytes.size());
-        auth_data.insert(auth_data.end(), aad.begin(), aad.end());
-        auth_data.insert(auth_data.end(), binding_bytes.begin(), binding_bytes.end());
-
-        if (algorithm_ == Algorithm::Aes256Gcm) {
-            detail::aes256_gcm_encrypt(
-                key.data(), key.size(),
-                reinterpret_cast<const uint8_t*>(plain.data()), plain.size(),
-                nonce_.data(), nonce_.size(),
-                auth_data.empty() ? nullptr : auth_data.data(), auth_data.size(),
-                ciphertext_,
-                tag_
-            );
-        } else if (algorithm_ == Algorithm::ChaCha20Poly1305) {
-            detail::chacha20_poly1305_encrypt(
-                key.data(), key.size(),
-                reinterpret_cast<const uint8_t*>(plain.data()), plain.size(),
-                nonce_.data(), nonce_.size(),
-                auth_data.empty() ? nullptr : auth_data.data(), auth_data.size(),
-                ciphertext_,
-                tag_
-            );
-        } else {
-            detail::secure_zero(key.data(), key.size());
-            throw std::runtime_error("Unsupported algorithm");
-        }
-
-        detail::secure_zero(key.data(), key.size());
+        encrypt_with_provider(plain, aad, alg, binding, provider);
     }
 
     SecureStringView decrypt(std::string_view aad = {}) const {
+        DecryptOptions opt;
+        return decrypt(aad, opt);
+    }
+
+    SecureStringView decrypt(std::string_view aad, const DecryptOptions& options) const {
+        if (options.require_aad && aad.empty()) {
+            throw std::runtime_error("AAD is required for decryption");
+        }
         if (ciphertext_.empty()) {
-            return SecureStringView(nullptr, 0);
+            return SecureStringView(detail::BufferAlloc{});
         }
 
         auto provider = detail::default_key_ring().resolve(key_id_);
@@ -1013,25 +1066,65 @@ public:
 
         detail::secure_zero(key.data(), key.size());
 
-        char* out = new char[plain.size() + 1];
-        if (!plain.empty()) {
-            std::memcpy(out, plain.data(), plain.size());
+        detail::BufferAlloc buf = detail::alloc_buffer(plain.size(), options.buffer);
+        if (plain.size() && !buf.ptr) {
+            detail::secure_zero(plain.data(), plain.size());
+            throw std::runtime_error("Failed to allocate plaintext buffer");
         }
-        out[plain.size()] = '\0';
+
+        if (!plain.empty()) {
+            std::memcpy(buf.ptr, plain.data(), plain.size());
+            buf.ptr[plain.size()] = '\0';
+        } else if (buf.ptr) {
+            buf.ptr[0] = '\0';
+        }
+
         detail::secure_zero(plain.data(), plain.size());
 
-        return SecureStringView(out, plain.size());
+        return SecureStringView(std::move(buf));
+    }
+
+
+    void rekey(
+        std::string_view aad = {},
+        Algorithm alg = Algorithm::Aes256Gcm,
+        RuntimeBinding binding = RuntimeBinding::Process
+    ) {
+        auto provider = detail::default_key_ring().primary();
+        if (!provider) {
+            throw std::runtime_error("No key provider configured");
+        }
+        rekey(provider, aad, alg, binding);
+    }
+
+    void rekey(
+        std::shared_ptr<KeyProvider> provider,
+        std::string_view aad = {},
+        Algorithm alg = Algorithm::Aes256Gcm,
+        RuntimeBinding binding = RuntimeBinding::Process
+    ) {
+        if (!provider) {
+            throw std::invalid_argument("KeyProvider cannot be null");
+        }
+        auto plain = decrypt(aad);
+        encrypt_with_provider(std::string_view(plain.c_str(), plain.size()), aad, alg, binding, provider);
     }
 
     std::vector<uint8_t> export_envelope() const {
         static constexpr uint32_t kMagic = 0x5243474E; // 'NGCR'
+        const bool v2 = version_ >= 2;
+        const size_t header = v2 ? (4 + 2 + 2 + 2 + 4 + 4) : (4 + 2 + 2 + 4 + 4);
+        const size_t meta_len = v2 ? 32 : 0;
+
         std::vector<uint8_t> out;
-        out.reserve(4 + 2 + 2 + 2 + 4 + 4 + salt_.size() + nonce_.size() + context_.size() + tag_.size() + ciphertext_.size());
+        out.reserve(header + 16 + 12 + 16 + 16 + meta_len + ciphertext_.size());
 
         detail::append_u32(out, kMagic);
         detail::append_u16(out, static_cast<uint16_t>(version_));
         detail::append_u16(out, static_cast<uint16_t>(algorithm_));
-        detail::append_u16(out, static_cast<uint16_t>(binding_));
+        if (v2) {
+            detail::append_u16(out, static_cast<uint16_t>(binding_));
+        }
         detail::append_u32(out, key_id_);
         detail::append_u32(out, static_cast<uint32_t>(ciphertext_.size()));
 
@@ -1039,29 +1132,65 @@ public:
         out.insert(out.end(), nonce_.begin(), nonce_.end());
         out.insert(out.end(), context_.begin(), context_.end());
         out.insert(out.end(), tag_.begin(), tag_.end());
+
+        if (v2) {
+            std::vector<uint8_t> meta;
+            meta.reserve(2 + 2 + 2 + 4 + 4 + salt_.size() + nonce_.size() + context_.size() + tag_.size());
+            detail::append_u16(meta, static_cast<uint16_t>(version_));
+            detail::append_u16(meta, static_cast<uint16_t>(algorithm_));
+            detail::append_u16(meta, static_cast<uint16_t>(binding_));
+            detail::append_u32(meta, key_id_);
+            detail::append_u32(meta, static_cast<uint32_t>(ciphertext_.size()));
+            meta.insert(meta.end(), salt_.begin(), salt_.end());
+            meta.insert(meta.end(), nonce_.begin(), nonce_.end());
+            meta.insert(meta.end(), context_.begin(), context_.end());
+            meta.insert(meta.end(), tag_.begin(), tag_.end());
+
+            std::vector<uint8_t> meta_hash = detail::sha256(std::move(meta));
+            out.insert(out.end(), meta_hash.begin(), meta_hash.end());
+        }
+
         out.insert(out.end(), ciphertext_.begin(), ciphertext_.end());
         return out;
     }
 
     static SecureString import_envelope(const std::vector<uint8_t>& data) {
         static constexpr uint32_t kMagic = 0x5243474E; // 'NGCR'
-        if (data.size() < 4 + 2 + 2 + 2 + 4 + 4) {
+        if (data.size() < 4 + 2 + 2 + 4 + 4) {
             throw std::runtime_error("Envelope too small");
         }
 
         size_t off = 0;
         const uint32_t magic = detail::read_u32(data, off);
         const uint16_t version = detail::read_u16(data, off);
-        const uint16_t alg = detail::read_u16(data, off);
-        const uint16_t binding = detail::read_u16(data, off);
-        const uint32_t key_id = detail::read_u32(data, off);
-        const uint32_t ciphertext_len = detail::read_u32(data, off);
-
         if (magic != kMagic || version == 0) {
             throw std::runtime_error("Invalid envelope header");
         }
 
-        const size_t fixed = (4 + 2 + 2 + 2 + 4 + 4) + 16 + 12 + 16 + 16;
+        uint16_t alg = 0;
+        uint16_t binding = static_cast<uint16_t>(RuntimeBinding::None);
+        uint32_t key_id = 0;
+        uint32_t ciphertext_len = 0;
+
+        if (version == 1) {
+            if (data.size() < 4 + 2 + 2 + 4 + 4) {
+                throw std::runtime_error("Envelope too small");
+            }
+            alg = detail::read_u16(data, off);
+            key_id = detail::read_u32(data, off);
+            ciphertext_len = detail::read_u32(data, off);
+        } else {
+            if (data.size() < 4 + 2 + 2 + 2 + 4 + 4) {
+                throw std::runtime_error("Envelope too small");
+            }
+            alg = detail::read_u16(data, off);
+            binding = detail::read_u16(data, off);
+            key_id = detail::read_u32(data, off);
+            ciphertext_len = detail::read_u32(data, off);
+        }
+
+        const bool v2 = version >= 2;
+        const size_t fixed = (version == 1 ? (4 + 2 + 2 + 4 + 4) : (4 + 2 + 2 + 2 + 4 + 4)) + 16 + 12 + 16 + 16 + (v2 ? 32 : 0);
         if (data.size() < fixed) {
             throw std::runtime_error("Envelope missing fields");
         }
@@ -1085,6 +1214,31 @@ public:
         off += s.context_.size();
         std::memcpy(s.tag_.data(), data.data() + off, s.tag_.size());
         off += s.tag_.size();
+
+        if (v2) {
+            std::vector<uint8_t> meta_hash(32);
+            std::memcpy(meta_hash.data(), data.data() + off, meta_hash.size());
+            off += meta_hash.size();
+
+            std::vector<uint8_t> meta;
+            meta.reserve(2 + 2 + 2 + 4 + 4 + s.salt_.size() + s.nonce_.size() + s.context_.size() + s.tag_.size());
+            detail::append_u16(meta, static_cast<uint16_t>(version));
+            detail::append_u16(meta, static_cast<uint16_t>(alg));
+            detail::append_u16(meta, static_cast<uint16_t>(binding));
+            detail::append_u32(meta, key_id);
+            detail::append_u32(meta, ciphertext_len);
+            meta.insert(meta.end(), s.salt_.begin(), s.salt_.end());
+            meta.insert(meta.end(), s.nonce_.begin(), s.nonce_.end());
+            meta.insert(meta.end(), s.context_.begin(), s.context_.end());
+            meta.insert(meta.end(), s.tag_.begin(), s.tag_.end());
+
+            std::vector<uint8_t> computed = detail::sha256(std::move(meta));
+            if (computed != meta_hash) {
+                throw std::runtime_error("Envelope metadata hash mismatch");
+            }
+        } else {
+            s.binding_ = RuntimeBinding::None;
+        }
 
         s.ciphertext_.assign(data.begin() + int(off), data.end());
         return s;

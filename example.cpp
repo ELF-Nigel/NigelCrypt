@@ -60,7 +60,11 @@ int main() {
     }
 
     auto s = SecureString::import_envelope(blob);
-    auto plain = s.decrypt();
+    nigelcrypt::DecryptOptions opt;
+    opt.buffer = nigelcrypt::BufferMode::VirtualLocked;
+    opt.require_aad = false;
+
+    auto plain = s.decrypt({}, opt);
     std::cout << "Decrypted: " << plain.c_str() << "\n";
     return 0;
 }
