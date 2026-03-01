@@ -33,6 +33,15 @@ if(NIGELCRYPT_BUILD_SHARED)
 endif()
 
 add_library(nigelcrypt_header INTERFACE)
+
+add_library(nigelcrypt_c STATIC src/nigelcrypt_c.cpp)
+target_include_directories(nigelcrypt_c PUBLIC ${NIGELCRYPT_INCLUDE_DIR})
+target_compile_features(nigelcrypt_c PUBLIC cxx_std_20)
+if(WIN32)
+    target_link_libraries(nigelcrypt_c PRIVATE bcrypt crypt32)
+else()
+    message(FATAL_ERROR "NigelCrypt currently supports Windows only.")
+endif()
 target_include_directories(nigelcrypt_header INTERFACE ${NIGELCRYPT_INCLUDE_DIR})
 
 target_compile_features(nigelcrypt_header INTERFACE cxx_std_20)
@@ -58,6 +67,7 @@ if(NIGELCRYPT_BUILD_EXAMPLES)
 endif()
 
 install(DIRECTORY include/ DESTINATION include)
+install(TARGETS nigelcrypt_c ARCHIVE DESTINATION lib)
 if(TARGET nigelcrypt_static)
     install(TARGETS nigelcrypt_static ARCHIVE DESTINATION lib)
 endif()

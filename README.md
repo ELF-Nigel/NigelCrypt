@@ -26,6 +26,30 @@ Header-only, Windows-only string protection utility focused on **real authentica
 ## Requirements
 
 ## SDK / Library Usage
+
+## C API Wrapper
+A C API is available in `include/nigelcrypt/nigelcrypt_c.h`.
+
+Example (C):
+```c
+#include "nigelcrypt/nigelcrypt_c.h"
+
+int main(void) {
+    nc_secure_string* s = nc_secure_string_new();
+    nc_secure_string_encrypt(s, "hello", 5, "aad", 3, NC_ALG_AES256_GCM, NC_BIND_PROCESS);
+
+    char out[64] = {0};
+    nc_decrypt_options opt = {0};
+    opt.buffer = NC_BUFFER_VIRTUAL_LOCKED;
+    opt.require_aad = 1;
+    opt.zero_on_failure = 1;
+
+    size_t wrote = 0;
+    nc_secure_string_decrypt_to(s, out, sizeof(out), "aad", 3, &opt, &wrote);
+    nc_secure_string_free(s);
+    return 0;
+}
+```
 Build with CMake to get static/shared libs or use header-only target:
 
 ```
