@@ -86,6 +86,14 @@ int main() {
     auto plain = s.decrypt("aad:packed", opt);
     std::cout << "Decrypted: " << plain.c_str() << "\n";
 
+    // Optional: protect/unprotect plaintext pages.
+    plain.protect();
+    plain.unprotect();
+
+    // Optional: decrypt into a caller-provided buffer (stack).
+    char buf[256] = {};
+    s.decrypt_to(buf, sizeof(buf), "aad:packed");
+
     // Example: in-memory secret with runtime binding + custom metadata.
     std::vector<uint8_t> meta = {0x4E,0x69,0x67,0x65,0x6C,0x43,0x72,0x79,0x70,0x74}; // "NigelCrypt"
     SecureString runtime_secret;

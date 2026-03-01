@@ -65,6 +65,7 @@ enum class BufferMode : uint16_t {
 struct DecryptOptions {
     BufferMode buffer = BufferMode::VirtualLocked;
     bool require_aad = false;
+    bool zero_on_failure = true;
 };
 
 
@@ -991,6 +992,24 @@ public:
         detail::free_buffer(buf_);
     }
 
+    // Set buffer pages to PAGE_NOACCESS (only works for virtual buffers).
+    void protect() {
+        if (buf_.mode == BufferMode::Heap || !buf_.base || buf_.alloc == 0) {
+            return;
+        }
+        DWORD oldp = 0;
+        ::VirtualProtect(buf_.base, buf_.alloc, PAGE_NOACCESS, &oldp);
+    }
+
+    // Restore buffer pages to PAGE_READWRITE.
+    void unprotect() {
+        if (buf_.mode == BufferMode::Heap || !buf_.base || buf_.alloc == 0) {
+            return;
+        }
+        DWORD oldp = 0;
+        ::VirtualProtect(buf_.base, buf_.alloc, PAGE_READWRITE, &oldp);
+    }
+
     void wipe_now() {
         reset();
     }
@@ -1182,6 +1201,41 @@ public:
     }
 
 
+
+    size_t decrypt_to(
+        char* out,
+        size_t out_len,
+        std::string_view aad = {},
+        const DecryptOptions& options = DecryptOptions{}
+    ) const {
+        if (!out || out_len == 0) {
+            throw std::invalid_argument("Output buffer is null or empty");
+        }
+
+        SecureStringView v;
+        try {
+            v = decrypt(aad, options);
+        } catch (...) {
+            if (options.zero_on_failure) {
+                detail::secure_zero(out, out_len);
+            }
+            throw;
+        }
+
+        if (v.size() + 1 > out_len) {
+            if (options.zero_on_failure) {
+                detail::secure_zero(out, out_len);
+            }
+            throw std::runtime_error("Output buffer too small");
+        }
+
+        if (v.size()) {
+            std::memcpy(out, v.c_str(), v.size());
+        }
+        out[v.size()] = '\0';
+        return v.size();
+    }
+
     void rekey(
         std::string_view aad = {},
         Algorithm alg = Algorithm::Aes256Gcm,
@@ -1192,6 +1246,41 @@ public:
             throw std::runtime_error("No key provider configured");
         }
         rekey(provider, aad, alg, binding);
+    }
+
+
+    size_t decrypt_to(
+        char* out,
+        size_t out_len,
+        std::string_view aad = {},
+        const DecryptOptions& options = DecryptOptions{}
+    ) const {
+        if (!out || out_len == 0) {
+            throw std::invalid_argument("Output buffer is null or empty");
+        }
+
+        SecureStringView v;
+        try {
+            v = decrypt(aad, options);
+        } catch (...) {
+            if (options.zero_on_failure) {
+                detail::secure_zero(out, out_len);
+            }
+            throw;
+        }
+
+        if (v.size() + 1 > out_len) {
+            if (options.zero_on_failure) {
+                detail::secure_zero(out, out_len);
+            }
+            throw std::runtime_error("Output buffer too small");
+        }
+
+        if (v.size()) {
+            std::memcpy(out, v.c_str(), v.size());
+        }
+        out[v.size()] = '\0';
+        return v.size();
     }
 
     void rekey(

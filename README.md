@@ -236,6 +236,24 @@ auto plain = s.decrypt("api:v1", opt);
 
 `BufferMode::VirtualLocked` (default) uses `VirtualLock` when possible. If locking fails, it falls back to an unlocked allocation.
 
+### Protect/Unprotect Plaintext Pages
+You can temporarily protect decrypted buffers with `PAGE_NOACCESS`:
+
+```cpp
+auto plain = s.decrypt("api:v1", opt);
+plain.protect();   // memory becomes inaccessible
+plain.unprotect(); // restore access
+```
+
+### Decrypt Into Caller Buffer
+For stack‑based buffers (no heap allocations):
+
+```cpp
+char buf[256] = {};
+size_t n = s.decrypt_to(buf, sizeof(buf), "api:v1");
+// use buf, then wipe if desired
+```
+
 ### Hardened Defaults
 You can opt into stricter defaults:
 
