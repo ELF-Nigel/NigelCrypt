@@ -193,20 +193,6 @@ Do not use process binding for build-time packed blobs, because the packer runs 
 
 
 ## Policy (App-Specific Rules)
-
-## Region Policy (Optional)
-Region policy is **application-defined**. You provide a resolver that returns a region string (e.g., "US"). This is suitable for licensing (best-effort).
-
-```cpp
-nigelcrypt::RegionPolicy rp;
-rp.enable = true;
-rp.resolver = []() { return std::string("US"); };
-rp.allowlist = {"US", "CA"};
-// or use blocklist: rp.blocklist = {"RU"};
-nigelcrypt::set_region_policy(rp);
-```
-
-If the resolver says the region is blocked or not allowed, decryption fails.
 You can enforce app-specific rules at runtime:
 
 ```cpp
@@ -222,6 +208,48 @@ nigelcrypt::set_policy(p);
 ```
 
 Decryption will fail if the policy is not satisfied.
+
+## Strict Mode
+Strict mode hard-fails decryption unless AAD, process binding, and algorithm requirements are met:
+
+```cpp
+nigelcrypt::StrictMode sm;
+sm.enabled = true;
+sm.require_aad = true;
+sm.require_binding = true;
+sm.require_algorithm = nigelcrypt::Algorithm::Aes256Gcm;
+nigelcrypt::set_strict_mode(sm);
+```
+
+## Region Policy (Optional)
+Region policy is **application-defined**. You provide a resolver that returns a region string (e.g., "US"). This is suitable for licensing (best-effort).
+
+```cpp
+nigelcrypt::RegionPolicy rp;
+rp.enable = true;
+rp.resolver = []() { return std::string("US"); };
+rp.allowlist = {"US", "CA"};
+// or use blocklist: rp.blocklist = {"RU"};
+nigelcrypt::set_region_policy(rp);
+```
+
+If the resolver says the region is blocked or not allowed, decryption fails.
+
+## DPAPI Secure Storage
+Encrypt/decrypt arbitrary blobs with DPAPI:
+
+```cpp
+std::vector<uint8_t> blob = {1,2,3};
+auto protected_blob = nigelcrypt::encrypt_blob_dpapi(blob, true);
+auto plain_blob = nigelcrypt::decrypt_blob_dpapi(protected_blob);
+```
+
+## Audit Envelope Metadata
+Inspect envelope metadata without decrypting:
+
+```cpp
+auto info = nigelcrypt::audit_envelope(blob);
+```
 
 ## Decrypt Options (Memory Hardening)
 You can control how plaintext buffers are allocated and whether AAD is required:

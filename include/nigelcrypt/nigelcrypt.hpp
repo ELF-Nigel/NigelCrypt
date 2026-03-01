@@ -62,6 +62,31 @@ enum class BufferMode : uint16_t {
     VirtualGuarded = 2
 };
 
+enum class Status : uint32_t {
+    Ok = 0,
+    InvalidArgument,
+    PolicyViolation,
+    RegionViolation,
+    DecryptFailed,
+    BufferTooSmall,
+    NotSupported,
+    StorageError
+};
+
+inline const char* status_message(Status s) {
+    switch (s) {
+        case Status::Ok: return "Ok";
+        case Status::InvalidArgument: return "InvalidArgument";
+        case Status::PolicyViolation: return "PolicyViolation";
+        case Status::RegionViolation: return "RegionViolation";
+        case Status::DecryptFailed: return "DecryptFailed";
+        case Status::BufferTooSmall: return "BufferTooSmall";
+        case Status::NotSupported: return "NotSupported";
+        case Status::StorageError: return "StorageError";
+        default: return "Unknown";
+    }
+}
+
 struct DecryptOptions {
     BufferMode buffer = BufferMode::VirtualLocked;
     bool require_aad = false;
@@ -105,6 +130,22 @@ inline DecryptOptions hardened_decrypt_options() {
     return o;
 }
 
+struct StrictMode {
+    bool enabled = false;
+    bool require_aad = true;
+    bool require_binding = true;
+    Algorithm require_algorithm = Algorithm::Aes256Gcm;
+};
+
+inline StrictMode& strict_mode() {
+    static StrictMode s{};
+    return s;
+}
+
+inline void set_strict_mode(const StrictMode& s) {
+    strict_mode() = s;
+}
+
 struct RegionPolicy {
     bool enable = false;
     std::vector<std::string> allowlist;
@@ -120,6 +161,90 @@ inline RegionPolicy& region_policy() {
 
 inline void set_region_policy(const RegionPolicy& p) {
     region_policy() = p;
+}
+
+inline std::vector<uint8_t> encrypt_blob_dpapi(const std::vector<uint8_t>& plain, bool local_machine = false) {
+    DATA_BLOB input{};
+    input.pbData = const_cast<BYTE*>(plain.data());
+    input.cbData = static_cast<DWORD>(plain.size());
+
+    DATA_BLOB output{};
+    DWORD flags = local_machine ? CRYPTPROTECT_LOCAL_MACHINE : 0;
+
+    if (!CryptProtectData(&input, L"NigelCryptBlob", nullptr, nullptr, nullptr, flags, &output)) {
+        throw std::runtime_error("CryptProtectData failed");
+    }
+
+    std::vector<uint8_t> out(output.pbData, output.pbData + output.cbData);
+    LocalFree(output.pbData);
+    return out;
+}
+
+inline std::vector<uint8_t> decrypt_blob_dpapi(const std::vector<uint8_t>& blob) {
+    DATA_BLOB input{};
+    input.pbData = const_cast<BYTE*>(blob.data());
+    input.cbData = static_cast<DWORD>(blob.size());
+
+    DATA_BLOB output{};
+    if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, 0, &output)) {
+        throw std::runtime_error("CryptUnprotectData failed");
+    }
+
+    std::vector<uint8_t> out(output.pbData, output.pbData + output.cbData);
+    LocalFree(output.pbData);
+    return out;
+}
+
+struct AuditInfo {
+    uint16_t version = 0;
+    Algorithm algorithm = Algorithm::Aes256Gcm;
+    RuntimeBinding binding = RuntimeBinding::None;
+    uint32_t key_id = 0;
+    uint32_t ciphertext_len = 0;
+    uint16_t custom_meta_len = 0;
+};
+
+inline AuditInfo audit_envelope(const std::vector<uint8_t>& data) {
+    if (data.size() < 4 + 2 + 2 + 4 + 4) {
+        throw std::runtime_error("Envelope too small");
+    }
+    size_t off = 0;
+    const uint32_t magic = detail::read_u32(data, off);
+    const uint16_t version = detail::read_u16(data, off);
+    if (magic != 0x5243474E || version == 0) {
+        throw std::runtime_error("Invalid envelope header");
+    }
+    uint16_t alg = 0;
+    uint16_t binding = 0;
+    uint32_t key_id = 0;
+    uint32_t ciphertext_len = 0;
+    uint16_t meta_len = 0;
+
+    if (version == 1) {
+        alg = detail::read_u16(data, off);
+        key_id = detail::read_u32(data, off);
+        ciphertext_len = detail::read_u32(data, off);
+    } else if (version == 2) {
+        alg = detail::read_u16(data, off);
+        binding = detail::read_u16(data, off);
+        key_id = detail::read_u32(data, off);
+        ciphertext_len = detail::read_u32(data, off);
+    } else {
+        alg = detail::read_u16(data, off);
+        binding = detail::read_u16(data, off);
+        key_id = detail::read_u32(data, off);
+        ciphertext_len = detail::read_u32(data, off);
+        meta_len = detail::read_u16(data, off);
+    }
+
+    AuditInfo info{};
+    info.version = version;
+    info.algorithm = static_cast<Algorithm>(alg);
+    info.binding = static_cast<RuntimeBinding>(binding);
+    info.key_id = key_id;
+    info.ciphertext_len = ciphertext_len;
+    info.custom_meta_len = meta_len;
+    return info;
 }
 
 namespace detail {
@@ -1099,6 +1224,18 @@ public:
         if (pol.min_key_id && key_id_ < pol.min_key_id) {
             throw std::runtime_error("Key id does not satisfy policy");
         }
+        const StrictMode& sm = strict_mode();
+        if (sm.enabled) {
+            if (sm.require_aad && aad.empty()) {
+                throw std::runtime_error("Strict mode: AAD required");
+            }
+            if (sm.require_binding && binding_ != RuntimeBinding::Process) {
+                throw std::runtime_error("Strict mode: process binding required");
+            }
+            if (algorithm_ != sm.require_algorithm) {
+                throw std::runtime_error("Strict mode: algorithm required");
+            }
+        }
         if (rp.enable) {
             if (!rp.resolver) {
                 throw std::runtime_error("Region policy enabled but no resolver provided");
@@ -1236,6 +1373,47 @@ public:
         return v.size();
     }
 
+
+    Status decrypt_to(
+        char* out,
+        size_t out_len,
+        std::string_view aad,
+        const DecryptOptions& options,
+        size_t* out_written
+    ) const {
+        if (!out || out_len == 0) {
+            return Status::InvalidArgument;
+        }
+        try {
+            SecureStringView v = decrypt(aad, options);
+            if (v.size() + 1 > out_len) {
+                if (options.zero_on_failure) {
+                    detail::secure_zero(out, out_len);
+                }
+                return Status::BufferTooSmall;
+            }
+            if (v.size()) {
+                std::memcpy(out, v.c_str(), v.size());
+            }
+            out[v.size()] = '\0';
+            if (out_written) {
+                *out_written = v.size();
+            }
+            return Status::Ok;
+        } catch (const std::runtime_error& e) {
+            (void)e;
+            if (options.zero_on_failure) {
+                detail::secure_zero(out, out_len);
+            }
+            return Status::DecryptFailed;
+        } catch (...) {
+            if (options.zero_on_failure) {
+                detail::secure_zero(out, out_len);
+            }
+            return Status::DecryptFailed;
+        }
+    }
+
     void rekey(
         std::string_view aad = {},
         Algorithm alg = Algorithm::Aes256Gcm,
@@ -1283,6 +1461,47 @@ public:
         return v.size();
     }
 
+
+    Status decrypt_to(
+        char* out,
+        size_t out_len,
+        std::string_view aad,
+        const DecryptOptions& options,
+        size_t* out_written
+    ) const {
+        if (!out || out_len == 0) {
+            return Status::InvalidArgument;
+        }
+        try {
+            SecureStringView v = decrypt(aad, options);
+            if (v.size() + 1 > out_len) {
+                if (options.zero_on_failure) {
+                    detail::secure_zero(out, out_len);
+                }
+                return Status::BufferTooSmall;
+            }
+            if (v.size()) {
+                std::memcpy(out, v.c_str(), v.size());
+            }
+            out[v.size()] = '\0';
+            if (out_written) {
+                *out_written = v.size();
+            }
+            return Status::Ok;
+        } catch (const std::runtime_error& e) {
+            (void)e;
+            if (options.zero_on_failure) {
+                detail::secure_zero(out, out_len);
+            }
+            return Status::DecryptFailed;
+        } catch (...) {
+            if (options.zero_on_failure) {
+                detail::secure_zero(out, out_len);
+            }
+            return Status::DecryptFailed;
+        }
+    }
+
     void rekey(
         std::shared_ptr<KeyProvider> provider,
         std::string_view aad = {},
@@ -1303,6 +1522,19 @@ public:
 
     const std::vector<uint8_t>& custom_meta() const {
         return custom_meta_;
+    }
+
+
+    bool auto_rekey(std::string_view aad = {}) {
+        auto provider = detail::default_key_ring().primary();
+        if (!provider) {
+            throw std::runtime_error("No key provider configured");
+        }
+        if (key_id_ == provider->key_id()) {
+            return false;
+        }
+        rekey(provider, aad, algorithm_, binding_);
+        return true;
     }
 
     std::vector<uint8_t> export_envelope() const {

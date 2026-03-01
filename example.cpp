@@ -57,6 +57,15 @@ int main() {
 
     nigelcrypt::set_policy(nigelcrypt::hardened_policy());
 
+    // Strict mode (hard-fail unless requirements are met).
+    nigelcrypt::StrictMode sm;
+    sm.enabled = false;
+    sm.require_aad = true;
+    sm.require_binding = true;
+    sm.require_algorithm = Algorithm::Aes256Gcm;
+    nigelcrypt::set_strict_mode(sm);
+
+
     // Configure key provider from the generated header parameters.
     std::vector<uint8_t> salt(
         nigelcrypt_packed::secret_salt.begin(),
@@ -80,11 +89,20 @@ int main() {
         return 1;
     }
 
+    auto info = nigelcrypt::audit_envelope(blob);
+    (void)info;
+
     auto s = SecureString::import_envelope(blob);
     auto opt = nigelcrypt::hardened_decrypt_options();
 
     auto plain = s.decrypt("aad:packed", opt);
     std::cout << "Decrypted: " << plain.c_str() << "\n";
+
+    // DPAPI secure storage example.
+    std::vector<uint8_t> blob_plain = {1, 2, 3};
+    auto blob_protected = nigelcrypt::encrypt_blob_dpapi(blob_plain, true);
+    auto blob_unprotected = nigelcrypt::decrypt_blob_dpapi(blob_protected);
+    (void)blob_unprotected;
 
     // Optional: protect/unprotect plaintext pages.
     plain.protect();
