@@ -36,12 +36,18 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
 
 namespace nigelcrypt {
+
+enum class Algorithm : uint32_t {
+    Aes256Gcm = 1,
+    ChaCha20Poly1305 = 2
+};
 
 namespace detail {
 
@@ -239,12 +245,13 @@ class KeyProvider {
 public:
     virtual ~KeyProvider() = default;
     virtual KeyBlob get_master_key() = 0;
+    virtual uint32_t key_id() const = 0;
 };
 
 class DpapiKeyProvider final : public KeyProvider {
 public:
-    explicit DpapiKeyProvider(KeyScope scope = KeyScope::CurrentUser, bool use_entropy = true)
-        : scope_(scope), use_entropy_(use_entropy) {
+    explicit DpapiKeyProvider(KeyScope scope = KeyScope::CurrentUser, bool use_entropy = true, uint32_t key_id = 1)
+        : scope_(scope), use_entropy_(use_entropy), key_id_(key_id) {
         std::array<uint8_t, 32> raw{};
         gen_random(raw.data(), raw.size());
 
@@ -302,24 +309,105 @@ public:
         return KeyBlob(key);
     }
 
+    uint32_t key_id() const override { return key_id_; }
+
 private:
     KeyScope scope_;
     bool use_entropy_;
+    uint32_t key_id_;
     std::vector<uint8_t> wrapped_;
     std::vector<uint8_t> entropy_;
     std::mutex mu_;
 };
 
-inline std::shared_ptr<KeyProvider>& default_key_provider() {
-    static std::shared_ptr<KeyProvider> provider = std::make_shared<DpapiKeyProvider>();
-    return provider;
+class CachedKeyProvider final : public KeyProvider {
+public:
+    explicit CachedKeyProvider(std::shared_ptr<KeyProvider> inner, uint64_t duration_ms = 300000)
+        : inner_(std::move(inner)), duration_ms_(duration_ms) {
+        if (!inner_) {
+            throw std::invalid_argument("CachedKeyProvider requires a valid inner provider");
+        }
+    }
+
+    KeyBlob get_master_key() override {
+        std::lock_guard<std::mutex> lock(mu_);
+        const uint64_t now = ::GetTickCount64();
+        if (cached_ && (duration_ms_ == kForever || now < expires_at_)) {
+            return KeyBlob(cached_->bytes);
+        }
+        cached_.reset();
+        KeyBlob fresh = inner_->get_master_key();
+        cached_ = std::make_unique<KeyBlob>(fresh.bytes);
+        expires_at_ = (duration_ms_ == kForever) ? kForever : (now + duration_ms_);
+        return fresh;
+    }
+
+    uint32_t key_id() const override { return inner_->key_id(); }
+
+    static constexpr uint64_t kForever = ~static_cast<uint64_t>(0);
+
+private:
+    std::shared_ptr<KeyProvider> inner_;
+    uint64_t duration_ms_;
+    uint64_t expires_at_ = 0;
+    std::unique_ptr<KeyBlob> cached_;
+    std::mutex mu_;
+};
+
+class KeyRing {
+public:
+    KeyRing() = default;
+
+    void set_primary(std::shared_ptr<KeyProvider> provider) {
+        if (!provider) {
+            throw std::invalid_argument("KeyProvider cannot be null");
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        primary_ = std::move(provider);
+        providers_[primary_->key_id()] = primary_;
+    }
+
+    void add_provider(std::shared_ptr<KeyProvider> provider) {
+        if (!provider) {
+            throw std::invalid_argument("KeyProvider cannot be null");
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        providers_[provider->key_id()] = std::move(provider);
+    }
+
+    std::shared_ptr<KeyProvider> resolve(uint32_t key_id) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = providers_.find(key_id);
+        if (it != providers_.end()) {
+            return it->second;
+        }
+        return primary_;
+    }
+
+    std::shared_ptr<KeyProvider> primary() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return primary_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::shared_ptr<KeyProvider> primary_;
+    std::unordered_map<uint32_t, std::shared_ptr<KeyProvider>> providers_;
+};
+
+inline KeyRing& default_key_ring() {
+    static KeyRing ring;
+    static std::once_flag init;
+    std::call_once(init, []() {
+        auto dpapi = std::make_shared<DpapiKeyProvider>();
+        auto cached = std::make_shared<CachedKeyProvider>(dpapi, CachedKeyProvider::kForever);
+        ring.set_primary(cached);
+    });
+    return ring;
 }
 
 inline void set_default_key_provider(std::shared_ptr<KeyProvider> provider) {
-    if (!provider) {
-        throw std::invalid_argument("KeyProvider cannot be null");
-    }
-    default_key_provider() = std::move(provider);
+    default_key_ring().set_primary(std::move(provider));
 }
 
 inline void aes256_gcm_encrypt(
@@ -446,15 +534,135 @@ inline std::vector<uint8_t> aes256_gcm_decrypt(
     return plaintext;
 }
 
+inline void chacha20_poly1305_encrypt(
+    const uint8_t* key, size_t key_len,
+    const uint8_t* plaintext, size_t plaintext_len,
+    const uint8_t* nonce, size_t nonce_len,
+    const uint8_t* aad, size_t aad_len,
+    std::vector<uint8_t>& ciphertext,
+    std::array<uint8_t, 16>& tag
+) {
+    BcryptAlgHandle alg(BCRYPT_CHACHA20_POLY1305_ALGORITHM, 0);
+
+    DWORD obj_len = 0;
+    DWORD cb = 0;
+    NTSTATUS st = BCryptGetProperty(alg.get(), BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_len), sizeof(obj_len), &cb, 0);
+    if (st < 0) {
+        throw_status("BCryptGetProperty(OBJECT_LENGTH) failed", st);
+    }
+
+    std::vector<uint8_t> key_obj(obj_len);
+    BCRYPT_KEY_HANDLE key_handle = nullptr;
+    st = BCryptGenerateSymmetricKey(alg.get(), &key_handle, key_obj.data(), obj_len, const_cast<PUCHAR>(key), static_cast<ULONG>(key_len), 0);
+    if (st < 0) {
+        throw_status("BCryptGenerateSymmetricKey failed", st);
+    }
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = const_cast<PUCHAR>(nonce);
+    info.cbNonce = static_cast<ULONG>(nonce_len);
+    info.pbAuthData = const_cast<PUCHAR>(aad);
+    info.cbAuthData = static_cast<ULONG>(aad_len);
+    info.pbTag = tag.data();
+    info.cbTag = static_cast<ULONG>(tag.size());
+
+    ULONG out_len = 0;
+    ciphertext.resize(plaintext_len);
+    st = BCryptEncrypt(
+        key_handle,
+        const_cast<PUCHAR>(plaintext),
+        static_cast<ULONG>(plaintext_len),
+        &info,
+        nullptr,
+        0,
+        ciphertext.data(),
+        static_cast<ULONG>(ciphertext.size()),
+        &out_len,
+        0
+    );
+
+    BCryptDestroyKey(key_handle);
+
+    if (st < 0) {
+        throw_status("BCryptEncrypt failed", st);
+    }
+
+    ciphertext.resize(out_len);
+}
+
+inline std::vector<uint8_t> chacha20_poly1305_decrypt(
+    const uint8_t* key, size_t key_len,
+    const uint8_t* ciphertext, size_t ciphertext_len,
+    const uint8_t* nonce, size_t nonce_len,
+    const uint8_t* aad, size_t aad_len,
+    const std::array<uint8_t, 16>& tag
+) {
+    BcryptAlgHandle alg(BCRYPT_CHACHA20_POLY1305_ALGORITHM, 0);
+
+    DWORD obj_len = 0;
+    DWORD cb = 0;
+    NTSTATUS st = BCryptGetProperty(alg.get(), BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_len), sizeof(obj_len), &cb, 0);
+    if (st < 0) {
+        throw_status("BCryptGetProperty(OBJECT_LENGTH) failed", st);
+    }
+
+    std::vector<uint8_t> key_obj(obj_len);
+    BCRYPT_KEY_HANDLE key_handle = nullptr;
+    st = BCryptGenerateSymmetricKey(alg.get(), &key_handle, key_obj.data(), obj_len, const_cast<PUCHAR>(key), static_cast<ULONG>(key_len), 0);
+    if (st < 0) {
+        throw_status("BCryptGenerateSymmetricKey failed", st);
+    }
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = const_cast<PUCHAR>(nonce);
+    info.cbNonce = static_cast<ULONG>(nonce_len);
+    info.pbAuthData = const_cast<PUCHAR>(aad);
+    info.cbAuthData = static_cast<ULONG>(aad_len);
+    info.pbTag = const_cast<PUCHAR>(tag.data());
+    info.cbTag = static_cast<ULONG>(tag.size());
+
+    ULONG out_len = 0;
+    std::vector<uint8_t> plaintext(ciphertext_len);
+    st = BCryptDecrypt(
+        key_handle,
+        const_cast<PUCHAR>(ciphertext),
+        static_cast<ULONG>(ciphertext_len),
+        &info,
+        nullptr,
+        0,
+        plaintext.data(),
+        static_cast<ULONG>(plaintext.size()),
+        &out_len,
+        0
+    );
+
+    BCryptDestroyKey(key_handle);
+
+    if (st < 0) {
+        throw_status("BCryptDecrypt failed", st);
+    }
+
+    plaintext.resize(out_len);
+    return plaintext;
+}
+
 } // namespace detail
 
 using KeyProvider = detail::KeyProvider;
 using KeyBlob = detail::KeyBlob;
 using DpapiKeyProvider = detail::DpapiKeyProvider;
+using CachedKeyProvider = detail::CachedKeyProvider;
+using KeyRing = detail::KeyRing;
 using KeyScope = detail::KeyScope;
 
 inline void set_key_provider(std::shared_ptr<KeyProvider> provider) {
     detail::set_default_key_provider(std::move(provider));
+}
+
+inline KeyRing& key_ring() {
+    return detail::default_key_ring();
 }
 
 class SecureStringView {
@@ -505,8 +713,8 @@ class SecureString {
 public:
     SecureString() = default;
 
-    explicit SecureString(std::string_view plain, std::string_view aad = {}) {
-        encrypt(plain, aad);
+    explicit SecureString(std::string_view plain, std::string_view aad = {}, Algorithm alg = Algorithm::Aes256Gcm) {
+        encrypt(plain, aad, alg);
     }
 
     SecureString(const SecureString&) = delete;
@@ -519,28 +727,41 @@ public:
     SecureString& operator=(SecureString&& other) noexcept {
         if (this != &other) {
             clear();
+            version_ = other.version_;
+            algorithm_ = other.algorithm_;
+            key_id_ = other.key_id_;
             ciphertext_ = std::move(other.ciphertext_);
             nonce_ = other.nonce_;
             tag_ = other.tag_;
             salt_ = other.salt_;
+            context_ = other.context_;
             other.ciphertext_.clear();
             other.nonce_.fill(0);
             other.tag_.fill(0);
             other.salt_.fill(0);
+            other.context_.fill(0);
         }
         return *this;
     }
 
     ~SecureString() { clear(); }
 
-    void encrypt(std::string_view plain, std::string_view aad = {}) {
+    void encrypt(std::string_view plain, std::string_view aad = {}, Algorithm alg = Algorithm::Aes256Gcm) {
         clear();
+
+        version_ = 1;
+        algorithm_ = alg;
 
         detail::gen_random(salt_.data(), salt_.size());
         detail::gen_random(nonce_.data(), nonce_.size());
         detail::gen_random(context_.data(), context_.size());
 
-        detail::KeyBlob master = detail::default_key_provider()->get_master_key();
+        auto provider = detail::default_key_ring().primary();
+        if (!provider) {
+            throw std::runtime_error("No key provider configured");
+        }
+        key_id_ = provider->key_id();
+        detail::KeyBlob master = provider->get_master_key();
         std::vector<uint8_t> ikm(master.bytes.begin(), master.bytes.end());
         std::vector<uint8_t> salt(salt_.begin(), salt_.end());
         std::vector<uint8_t> info;
@@ -550,14 +771,28 @@ public:
 
         std::vector<uint8_t> key = detail::hkdf_sha256(std::move(ikm), std::move(salt), std::move(info), 32);
 
-        detail::aes256_gcm_encrypt(
-            key.data(), key.size(),
-            reinterpret_cast<const uint8_t*>(plain.data()), plain.size(),
-            nonce_.data(), nonce_.size(),
-            reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
-            ciphertext_,
-            tag_
-        );
+        if (algorithm_ == Algorithm::Aes256Gcm) {
+            detail::aes256_gcm_encrypt(
+                key.data(), key.size(),
+                reinterpret_cast<const uint8_t*>(plain.data()), plain.size(),
+                nonce_.data(), nonce_.size(),
+                reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                ciphertext_,
+                tag_
+            );
+        } else if (algorithm_ == Algorithm::ChaCha20Poly1305) {
+            detail::chacha20_poly1305_encrypt(
+                key.data(), key.size(),
+                reinterpret_cast<const uint8_t*>(plain.data()), plain.size(),
+                nonce_.data(), nonce_.size(),
+                reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                ciphertext_,
+                tag_
+            );
+        } else {
+            detail::secure_zero(key.data(), key.size());
+            throw std::runtime_error("Unsupported algorithm");
+        }
 
         detail::secure_zero(key.data(), key.size());
     }
@@ -567,7 +802,11 @@ public:
             return SecureStringView(nullptr, 0);
         }
 
-        detail::KeyBlob master = detail::default_key_provider()->get_master_key();
+        auto provider = detail::default_key_ring().resolve(key_id_);
+        if (!provider) {
+            throw std::runtime_error("No key provider configured");
+        }
+        detail::KeyBlob master = provider->get_master_key();
         std::vector<uint8_t> ikm(master.bytes.begin(), master.bytes.end());
         std::vector<uint8_t> salt(salt_.begin(), salt_.end());
         std::vector<uint8_t> info;
@@ -577,13 +816,27 @@ public:
 
         std::vector<uint8_t> key = detail::hkdf_sha256(std::move(ikm), std::move(salt), std::move(info), 32);
 
-        std::vector<uint8_t> plain = detail::aes256_gcm_decrypt(
-            key.data(), key.size(),
-            ciphertext_.data(), ciphertext_.size(),
-            nonce_.data(), nonce_.size(),
-            reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
-            tag_
-        );
+        std::vector<uint8_t> plain;
+        if (algorithm_ == Algorithm::Aes256Gcm) {
+            plain = detail::aes256_gcm_decrypt(
+                key.data(), key.size(),
+                ciphertext_.data(), ciphertext_.size(),
+                nonce_.data(), nonce_.size(),
+                reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                tag_
+            );
+        } else if (algorithm_ == Algorithm::ChaCha20Poly1305) {
+            plain = detail::chacha20_poly1305_decrypt(
+                key.data(), key.size(),
+                ciphertext_.data(), ciphertext_.size(),
+                nonce_.data(), nonce_.size(),
+                reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                tag_
+            );
+        } else {
+            detail::secure_zero(key.data(), key.size());
+            throw std::runtime_error("Unsupported algorithm");
+        }
 
         detail::secure_zero(key.data(), key.size());
 
@@ -595,6 +848,85 @@ public:
         detail::secure_zero(plain.data(), plain.size());
 
         return SecureStringView(out, plain.size());
+    }
+
+    std::vector<uint8_t> export_envelope() const {
+        static constexpr uint32_t kMagic = 0x5243474E; // 'NGCR'
+        struct Header {
+            uint32_t magic;
+            uint16_t version;
+            uint16_t alg;
+            uint32_t key_id;
+            uint32_t ciphertext_len;
+        };
+
+        Header h{};
+        h.magic = kMagic;
+        h.version = static_cast<uint16_t>(version_);
+        h.alg = static_cast<uint16_t>(algorithm_);
+        h.key_id = key_id_;
+        h.ciphertext_len = static_cast<uint32_t>(ciphertext_.size());
+
+        std::vector<uint8_t> out;
+        out.reserve(sizeof(Header) + salt_.size() + nonce_.size() + context_.size() + tag_.size() + ciphertext_.size());
+
+        const uint8_t* hp = reinterpret_cast<const uint8_t*>(&h);
+        out.insert(out.end(), hp, hp + sizeof(Header));
+        out.insert(out.end(), salt_.begin(), salt_.end());
+        out.insert(out.end(), nonce_.begin(), nonce_.end());
+        out.insert(out.end(), context_.begin(), context_.end());
+        out.insert(out.end(), tag_.begin(), tag_.end());
+        out.insert(out.end(), ciphertext_.begin(), ciphertext_.end());
+        return out;
+    }
+
+    static SecureString import_envelope(const std::vector<uint8_t>& data) {
+        static constexpr uint32_t kMagic = 0x5243474E; // 'NGCR'
+        struct Header {
+            uint32_t magic;
+            uint16_t version;
+            uint16_t alg;
+            uint32_t key_id;
+            uint32_t ciphertext_len;
+        };
+
+        if (data.size() < sizeof(Header)) {
+            throw std::runtime_error("Envelope too small");
+        }
+
+        Header h{};
+        std::memcpy(&h, data.data(), sizeof(Header));
+        if (h.magic != kMagic || h.version == 0) {
+            throw std::runtime_error("Invalid envelope header");
+        }
+
+        const size_t fixed = sizeof(Header) + 16 + 12 + 16 + 16;
+        if (data.size() < fixed) {
+            throw std::runtime_error("Envelope missing fields");
+        }
+
+        const size_t expected = fixed + h.ciphertext_len;
+        if (data.size() != expected) {
+            throw std::runtime_error("Envelope size mismatch");
+        }
+
+        SecureString s;
+        s.version_ = h.version;
+        s.algorithm_ = static_cast<Algorithm>(h.alg);
+        s.key_id_ = h.key_id;
+
+        size_t off = sizeof(Header);
+        std::memcpy(s.salt_.data(), data.data() + off, s.salt_.size());
+        off += s.salt_.size();
+        std::memcpy(s.nonce_.data(), data.data() + off, s.nonce_.size());
+        off += s.nonce_.size();
+        std::memcpy(s.context_.data(), data.data() + off, s.context_.size());
+        off += s.context_.size();
+        std::memcpy(s.tag_.data(), data.data() + off, s.tag_.size());
+        off += s.tag_.size();
+
+        s.ciphertext_.assign(data.begin() + static_cast<long>(off), data.end());
+        return s;
     }
 
     void clear() {
@@ -609,6 +941,9 @@ public:
     }
 
 private:
+    uint16_t version_ = 1;
+    Algorithm algorithm_ = Algorithm::Aes256Gcm;
+    uint32_t key_id_ = 1;
     std::vector<uint8_t> ciphertext_;
     std::array<uint8_t, 12> nonce_{}; // 96-bit nonce for GCM
     std::array<uint8_t, 16> tag_{};   // 128-bit tag
