@@ -14,6 +14,7 @@ Header-only, Windows-only string protection utility focused on **real authentica
 - Short plaintext lifetime with secure zeroing of buffers.
 - Optional Associated Data (AAD) to bind decryption to a context.
 - Versioned envelope export/import for storage and key rotation.
+- Optional build-time packing to keep plaintext out of your binary.
 
 ## What This Is Not
 - Not anti-debugging, anti-tamper, or polymorphic obfuscation.
@@ -41,6 +42,39 @@ int main() {
     return 0;
 }
 ```
+
+## Avoiding Embedded String Literals (Build-Time Packing)
+If you want to ensure plaintext is **not embedded** in the binary, you must avoid string literals. Use the packer tool to encrypt a plaintext file at build time, then embed only ciphertext.
+
+### 1) Create a plaintext file (not checked into source control)
+```\nsecret.txt\n```
+
+### 2) Run the packer (on Windows)
+```\nset NIGELCRYPT_PASSPHRASE=your-strong-passphrase\nnigelcrypt_pack --in secret.txt --out packed/secret_blob.hpp --name secret --pass-env NIGELCRYPT_PASSPHRASE\n```
+
+This generates `packed/secret_blob.hpp` containing only ciphertext, salt, iteration count, and key id.
+
+### 3) Decrypt at runtime
+```cpp
+#include \"nigelcrypt.hpp\"
+#include \"packed/secret_blob.hpp\"
+
+const char* pass = std::getenv(\"NIGELCRYPT_PASSPHRASE\");
+auto provider = std::make_shared<nigelcrypt::PasswordKeyProvider>(
+    std::string(pass),
+    std::vector<uint8_t>(nigelcrypt_packed::secret_salt.begin(), nigelcrypt_packed::secret_salt.end()),
+    nigelcrypt_packed::secret_iterations,
+    nigelcrypt_packed::secret_key_id
+);
+nigelcrypt::set_key_provider(provider);
+
+auto s = nigelcrypt::SecureString::import_envelope(
+    std::vector<uint8_t>(nigelcrypt_packed::secret_blob.begin(), nigelcrypt_packed::secret_blob.end())
+);
+auto plain = s.decrypt();
+```
+
+**Important:** The passphrase must be supplied at runtime (env var, user input, secure vault). Do not hardcode it.
 
 ## Algorithm Selection
 Choose AES-256-GCM (default) or ChaCha20-Poly1305:

@@ -49,6 +49,11 @@ enum class Algorithm : uint32_t {
     ChaCha20Poly1305 = 2
 };
 
+enum class RuntimeBinding : uint16_t {
+    None = 0,
+    Process = 1
+};
+
 namespace detail {
 
 inline void secure_zero(void* ptr, size_t len) {
@@ -123,6 +128,97 @@ inline std::vector<uint8_t> sha256(std::vector<uint8_t> data) {
     if (st < 0) {
         throw_status("BCryptFinishHash failed", st);
     }
+
+    return out;
+}
+
+inline std::array<uint8_t, 32> pbkdf2_sha256(
+    std::string_view passphrase,
+    const std::vector<uint8_t>& salt,
+    uint64_t iterations
+) {
+    if (passphrase.empty()) {
+        throw std::invalid_argument("Passphrase cannot be empty");
+    }
+    if (salt.empty()) {
+        throw std::invalid_argument("Salt cannot be empty");
+    }
+    if (iterations == 0) {
+        throw std::invalid_argument("Iterations must be > 0");
+    }
+
+    BcryptAlgHandle alg(BCRYPT_SHA256_ALGORITHM, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+
+    std::array<uint8_t, 32> out{};
+    NTSTATUS st = BCryptDeriveKeyPBKDF2(
+        alg.get(),
+        reinterpret_cast<PUCHAR>(const_cast<char*>(passphrase.data())),
+        static_cast<ULONG>(passphrase.size()),
+        const_cast<PUCHAR>(salt.data()),
+        static_cast<ULONG>(salt.size()),
+        iterations,
+        out.data(),
+        static_cast<ULONG>(out.size()),
+        0
+    );
+    if (st < 0) {
+        throw_status("BCryptDeriveKeyPBKDF2 failed", st);
+    }
+    return out;
+}
+
+inline void append_u16(std::vector<uint8_t>& out, uint16_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+}
+
+inline void append_u32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+}
+
+inline uint16_t read_u16(const std::vector<uint8_t>& in, size_t& off) {
+    if (off + 2 > in.size()) {
+        throw std::runtime_error("Envelope truncated");
+    }
+    uint16_t v = static_cast<uint16_t>(in[off]) |
+                 (static_cast<uint16_t>(in[off + 1]) << 8);
+    off += 2;
+    return v;
+}
+
+inline uint32_t read_u32(const std::vector<uint8_t>& in, size_t& off) {
+    if (off + 4 > in.size()) {
+        throw std::runtime_error("Envelope truncated");
+    }
+    uint32_t v = static_cast<uint32_t>(in[off]) |
+                 (static_cast<uint32_t>(in[off + 1]) << 8) |
+                 (static_cast<uint32_t>(in[off + 2]) << 16) |
+                 (static_cast<uint32_t>(in[off + 3]) << 24);
+    off += 4;
+    return v;
+}
+
+inline std::vector<uint8_t> runtime_binding_bytes(RuntimeBinding binding) {
+    if (binding == RuntimeBinding::None) {
+        return {};
+    }
+
+    std::vector<uint8_t> out;
+    out.reserve(24);
+
+    const uint32_t pid = ::GetCurrentProcessId();
+    const uintptr_t module_base = reinterpret_cast<uintptr_t>(::GetModuleHandleW(nullptr));
+    static int runtime_salt = 0;
+    const uintptr_t salt_addr = reinterpret_cast<uintptr_t>(&runtime_salt);
+
+    append_u32(out, pid);
+    append_u32(out, static_cast<uint32_t>(module_base & 0xFFFFFFFFu));
+    append_u32(out, static_cast<uint32_t>((module_base >> 32) & 0xFFFFFFFFu));
+    append_u32(out, static_cast<uint32_t>(salt_addr & 0xFFFFFFFFu));
+    append_u32(out, static_cast<uint32_t>((salt_addr >> 32) & 0xFFFFFFFFu));
 
     return out;
 }
@@ -317,6 +413,37 @@ private:
     uint32_t key_id_;
     std::vector<uint8_t> wrapped_;
     std::vector<uint8_t> entropy_;
+    std::mutex mu_;
+};
+
+class PasswordKeyProvider final : public KeyProvider {
+public:
+    PasswordKeyProvider(std::string passphrase, std::vector<uint8_t> salt, uint64_t iterations, uint32_t key_id = 1)
+        : passphrase_(std::move(passphrase)), salt_(std::move(salt)), iterations_(iterations), key_id_(key_id) {
+        if (passphrase_.empty()) {
+            throw std::invalid_argument("Passphrase cannot be empty");
+        }
+        if (salt_.empty()) {
+            throw std::invalid_argument("Salt cannot be empty");
+        }
+        if (iterations_ == 0) {
+            throw std::invalid_argument("Iterations must be > 0");
+        }
+    }
+
+    KeyBlob get_master_key() override {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto key = pbkdf2_sha256(passphrase_, salt_, iterations_);
+        return KeyBlob(key);
+    }
+
+    uint32_t key_id() const override { return key_id_; }
+
+private:
+    std::string passphrase_;
+    std::vector<uint8_t> salt_;
+    uint64_t iterations_;
+    uint32_t key_id_;
     std::mutex mu_;
 };
 
@@ -653,6 +780,7 @@ inline std::vector<uint8_t> chacha20_poly1305_decrypt(
 using KeyProvider = detail::KeyProvider;
 using KeyBlob = detail::KeyBlob;
 using DpapiKeyProvider = detail::DpapiKeyProvider;
+using PasswordKeyProvider = detail::PasswordKeyProvider;
 using CachedKeyProvider = detail::CachedKeyProvider;
 using KeyRing = detail::KeyRing;
 using KeyScope = detail::KeyScope;
