@@ -3,7 +3,7 @@
 Header-only, Windows-only string protection utility focused on **real authenticated encryption**, **per-string keys**, and **short plaintext lifetimes** at runtime. It is **not** an anti-analysis or obfuscation framework. It protects runtime storage, not compile-time literals.
 
 **Author contacts**
-- Discord: `chefendpoint`
+- Discord: `pb2j`
 - Telegram: `ELF_Nigel`
 
 ## What This Is
